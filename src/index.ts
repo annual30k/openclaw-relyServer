@@ -59,6 +59,18 @@ type PendingResponse = {
   riskLevel: "L1" | "L2" | "L3";
 };
 
+type PendingHostCommand = {
+  gatewayId: string;
+  userId: string;
+  method: string;
+  startedAt: number;
+  paramsMasked: string;
+  riskLevel: "L1" | "L2" | "L3";
+  resolve: (payload: unknown) => void;
+  reject: (error: Error) => void;
+  timeout: NodeJS.Timeout;
+};
+
 type TokenClaims = {
   userId: string;
   deviceId: string;
@@ -70,6 +82,7 @@ type TokenClaims = {
 const hostSessions = new Map<string, HostSession>();
 const mobileSessions = new Map<string, MobileSession>();
 const pendingResponses = new Map<string, PendingResponse>();
+const pendingHostCommands = new Map<string, PendingHostCommand>();
 const rateLimitBuckets = new Map<string, number[]>();
 
 const hostWsServer = new WebSocketServer({ noServer: true });
@@ -109,8 +122,9 @@ function normalizeGatewayRuntime(gatewayIdValue: string): GatewayRuntimeStateRec
 
 function computeAggregateStatus(runtime: GatewayRuntimeStateRecord): GatewayRuntimeStateRecord["aggregateStatus"] {
   if (runtime.hostStatus === "healthy" || runtime.openclawStatus === "healthy") return "healthy";
-  if (runtime.relayStatus === "relay_connected" || runtime.hostStatus === "connecting_openclaw") return "connecting";
   if (runtime.hostStatus === "degraded" || runtime.openclawStatus === "degraded") return "degraded";
+  if (runtime.hostStatus === "connecting_openclaw") return "connecting";
+  if (runtime.relayStatus === "relay_connected") return "degraded";
   return "offline";
 }
 
@@ -181,6 +195,8 @@ function buildGatewaySummary(gateway: GatewayRecord) {
     openclawStatus: runtime.openclawStatus,
     mobileControlStatus: runtime.mobileControlStatus,
     lastSeenAt: gateway.lastSeenAt ?? gateway.createdAt,
+    currentModel: runtime.currentModel ?? "--",
+    contextUsage: runtime.contextUsage ?? 0,
   };
 }
 
@@ -190,11 +206,11 @@ function sendSocket(socket: WebSocket, envelope: RelayEnvelope): void {
   }
 }
 
-function broadcastToGatewayMembers(gatewayIdValue: string, envelope: RelayEnvelope): void {
+function broadcastToGatewayMembers(gatewayIdValue: string, envelope: RelayEnvelope, excludedSocket?: WebSocket): void {
   const memberships = store.snapshot().gatewayMemberships.filter((membership) => membership.gatewayId === gatewayIdValue);
   for (const membership of memberships) {
     for (const session of mobileSessions.values()) {
-      if (session.userId === membership.userId) {
+      if (session.userId === membership.userId && session.socket !== excludedSocket) {
         sendSocket(session.socket, envelope);
       }
     }
@@ -218,6 +234,72 @@ function failPending(id: string, code: string, message: string): void {
     errorCode: code,
     durationMs: Date.now() - pending.startedAt,
     createdAt: nowIso(),
+  });
+}
+
+function failPendingHostCommand(id: string, code: string, message: string): void {
+  const pending = pendingHostCommands.get(id);
+  if (!pending) return;
+  pendingHostCommands.delete(id);
+  clearTimeout(pending.timeout);
+  metrics.commandFailures += 1;
+  pending.reject(new Error(`${code}: ${message}`));
+  store.addAuditLog({
+    id: randomUUID(),
+    gatewayId: pending.gatewayId,
+    userId: pending.userId,
+    method: pending.method,
+    riskLevel: pending.riskLevel,
+    paramsMasked: pending.paramsMasked,
+    resultOk: false,
+    errorCode: code,
+    durationMs: Date.now() - pending.startedAt,
+    createdAt: nowIso(),
+  });
+}
+
+async function dispatchHostCommand(
+  gatewayIdValue: string,
+  userId: string,
+  method: string,
+  params: unknown,
+): Promise<unknown> {
+  const host = hostSessions.get(gatewayIdValue);
+  if (!host) {
+    throw new Error("gateway_offline: Gateway is offline");
+  }
+
+  const requestId = randomUUID();
+  const riskLevel = classifyRisk(method);
+  const paramsMasked = maskSensitive(params);
+
+  metrics.commandRequests += 1;
+  if (riskLevel === "L3") metrics.highRiskCommands += 1;
+
+  return await new Promise<unknown>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      failPendingHostCommand(requestId, "timeout", "Gateway command timed out");
+    }, 15_000);
+
+    pendingHostCommands.set(requestId, {
+      gatewayId: gatewayIdValue,
+      userId,
+      method,
+      startedAt: Date.now(),
+      paramsMasked,
+      riskLevel,
+      resolve,
+      reject,
+      timeout,
+    });
+
+    sendSocket(host.socket, {
+      type: "cmd",
+      id: requestId,
+      gatewayId: gatewayIdValue,
+      method,
+      params,
+    });
   });
 }
 
@@ -421,6 +503,206 @@ async function handleGatewayDelete(req: IncomingMessage, res: ServerResponse, ga
   json(res, 200, { ok: true });
 }
 
+async function handleGatewayModels(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const userId = getUserIdFromRequest(req, null);
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "pocketclaw.model.list", {});
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    await persist();
+    const result = (payload ?? {}) as { items?: unknown[] };
+    const runtime = normalizeGatewayRuntime(gatewayIdValue);
+    const currentModel = runtime.currentModel;
+    const items = Array.isArray(result.items)
+      ? result.items.map((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+          const record = { ...(item as Record<string, unknown>) };
+          if (typeof currentModel === "string" && currentModel.length > 0) {
+            record.isSelected = record["alias"] === currentModel || record["name"] === currentModel;
+          }
+          return record;
+        })
+      : [];
+    json(res, 200, { items });
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
+async function handleGatewayChatHistory(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string, requestUrl: URL): Promise<void> {
+  const userId = getUserIdFromRequest(req, null);
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+
+  const sessionKey = requestUrl.searchParams.get("sessionKey")?.trim() || "main";
+  const requestedLimit = Number.parseInt(requestUrl.searchParams.get("limit") ?? "100", 10);
+  const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 200)) : 100;
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "chat.history", {
+      sessionKey,
+      limit,
+    });
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    await persist();
+    const result = (payload ?? {}) as { messages?: unknown[] };
+    const items = Array.isArray(result.messages)
+      ? result.messages.flatMap((entry, index) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+          const record = entry as Record<string, unknown>;
+          const role = typeof record.role === "string" ? record.role : "assistant";
+          const content = Array.isArray(record.content)
+            ? record.content
+                .filter((block): block is Record<string, unknown> => Boolean(block) && typeof block === "object" && !Array.isArray(block))
+                .filter((block) => block.type === "text" && typeof block.text === "string")
+                .map((block) => String(block.text))
+                .join("\n\n")
+                .trim()
+            : "";
+          if (!content) return [];
+          return [{
+            id: `history-${index}`,
+            role,
+            content,
+          }];
+        })
+      : [];
+    json(res, 200, { items });
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
+async function handleGatewayDefaultModelSelect(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const userId = getUserIdFromRequest(req, body);
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
+  const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
+  const modelAlias = typeof body.modelAlias === "string" ? body.modelAlias.trim() : "";
+  if (!providerId || !modelId) {
+    json(res, 400, { error: "providerId_and_modelId_required" });
+    return;
+  }
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "pocketclaw.model.setDefault", {
+      providerId,
+      modelId,
+      modelAlias,
+    });
+    const gateway = store.snapshot().gateways[gatewayIdValue];
+    if (gateway) {
+      broadcastToGatewayMembers(gatewayIdValue, {
+        type: "presence",
+        gatewayId: gatewayIdValue,
+        payload: buildGatewaySummary(gateway),
+      });
+    }
+    broadcastToGatewayMembers(gatewayIdValue, {
+      type: "event",
+      gatewayId: gatewayIdValue,
+      event: "default_model_updated",
+      payload: {
+        providerId,
+        modelId,
+        modelAlias,
+      },
+    });
+    json(res, 200, { ok: true, payload });
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
+async function handleGatewayModelSelect(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const userId = getUserIdFromRequest(req, body);
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
+  const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
+  const modelAlias = typeof body.modelAlias === "string" ? body.modelAlias.trim() : "";
+  const modelName = typeof body.modelName === "string" ? body.modelName.trim() : modelAlias;
+  if (!providerId || !modelId || !modelAlias) {
+    json(res, 400, { error: "providerId_modelId_and_modelAlias_required" });
+    return;
+  }
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "chat.send", {
+      sessionKey: "main",
+      message: `/model ${modelAlias}`,
+      idempotencyKey: randomUUID(),
+    });
+    touchGateway(gatewayIdValue, {
+      currentModel: modelAlias,
+      lastSeenAt: nowIso(),
+    });
+    await persist();
+
+    const gateway = store.snapshot().gateways[gatewayIdValue];
+    if (gateway) {
+      broadcastToGatewayMembers(gatewayIdValue, {
+        type: "presence",
+        gatewayId: gatewayIdValue,
+        payload: buildGatewaySummary(gateway),
+      });
+    }
+    broadcastToGatewayMembers(gatewayIdValue, {
+      type: "event",
+      gatewayId: gatewayIdValue,
+      event: "model_selected",
+      payload: {
+        providerId,
+        modelId,
+        modelAlias,
+        modelName,
+        currentModel: modelAlias,
+      },
+    });
+
+    json(res, 200, { ok: true, payload });
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
 async function handleApproveSensitiveAction(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
   const userId = getUserIdFromRequest(req, body);
@@ -526,6 +808,30 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  const modelsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models$/);
+  if (modelsMatch && req.method === "GET") {
+    await handleGatewayModels(req, res, modelsMatch[1]);
+    return;
+  }
+
+  const chatHistoryMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/history$/);
+  if (chatHistoryMatch && req.method === "GET") {
+    await handleGatewayChatHistory(req, res, chatHistoryMatch[1], requestUrl);
+    return;
+  }
+
+  const modelSelectMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models\/select$/);
+  if (modelSelectMatch && req.method === "POST") {
+    await handleGatewayModelSelect(req, res, modelSelectMatch[1]);
+    return;
+  }
+
+  const defaultModelSelectMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models\/default$/);
+  if (defaultModelSelectMatch && req.method === "POST") {
+    await handleGatewayDefaultModelSelect(req, res, defaultModelSelectMatch[1]);
+    return;
+  }
+
   const approvalMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/approve-sensitive-action$/);
   if (approvalMatch && req.method === "POST") {
     await handleApproveSensitiveAction(req, res, approvalMatch[1]);
@@ -586,6 +892,7 @@ hostWsServer.on("connection", async (socket, req) => {
   socket.on("message", async (raw) => {
     const message = safeJsonParse<RelayEnvelope>(raw.toString());
     if (!message?.type) return;
+    console.log(`[relay-host] gateway=${gatewayIdValue} type=${message.type}`);
 
     const session = hostSessions.get(gatewayIdValue);
     if (session) session.lastSeenAt = nowIso();
@@ -655,30 +962,74 @@ hostWsServer.on("connection", async (socket, req) => {
 
     if (message.type === "res" && message.id) {
       const pending = pendingResponses.get(message.id);
-      if (!pending) return;
-      pendingResponses.delete(message.id);
+      if (pending) {
+        pendingResponses.delete(message.id);
+        if (!message.ok) metrics.commandFailures += 1;
+        if (message.ok) {
+          touchGateway(gatewayIdValue, {
+            relayStatus: "relay_connected",
+            hostStatus: "healthy",
+            openclawStatus: "healthy",
+            lastSeenAt: nowIso(),
+          });
+        }
+        store.addAuditLog({
+          id: randomUUID(),
+          gatewayId: pending.gatewayId,
+          userId: pending.userId,
+          method: pending.method,
+          riskLevel: pending.riskLevel,
+          paramsMasked: pending.paramsMasked,
+          resultOk: Boolean(message.ok),
+          errorCode: message.error?.code ?? (message.ok ? undefined : "host_error"),
+          durationMs: Date.now() - pending.startedAt,
+          createdAt: nowIso(),
+        });
+        await persist();
+        sendSocket(pending.socket, {
+          type: "res",
+          id: message.id,
+          gatewayId: gatewayIdValue,
+          ok: Boolean(message.ok),
+          payload: message.payload,
+          error: message.error,
+        });
+        return;
+      }
+
+      const pendingHostCommand = pendingHostCommands.get(message.id);
+      if (!pendingHostCommand) return;
+
+      pendingHostCommands.delete(message.id);
+      clearTimeout(pendingHostCommand.timeout);
       if (!message.ok) metrics.commandFailures += 1;
+      if (message.ok) {
+        touchGateway(gatewayIdValue, {
+          relayStatus: "relay_connected",
+          hostStatus: "healthy",
+          openclawStatus: "healthy",
+          lastSeenAt: nowIso(),
+        });
+      }
       store.addAuditLog({
         id: randomUUID(),
-        gatewayId: pending.gatewayId,
-        userId: pending.userId,
-        method: pending.method,
-        riskLevel: pending.riskLevel,
-        paramsMasked: pending.paramsMasked,
+        gatewayId: pendingHostCommand.gatewayId,
+        userId: pendingHostCommand.userId,
+        method: pendingHostCommand.method,
+        riskLevel: pendingHostCommand.riskLevel,
+        paramsMasked: pendingHostCommand.paramsMasked,
         resultOk: Boolean(message.ok),
         errorCode: message.error?.code ?? (message.ok ? undefined : "host_error"),
-        durationMs: Date.now() - pending.startedAt,
+        durationMs: Date.now() - pendingHostCommand.startedAt,
         createdAt: nowIso(),
       });
       await persist();
-      sendSocket(pending.socket, {
-        type: "res",
-        id: message.id,
-        gatewayId: gatewayIdValue,
-        ok: Boolean(message.ok),
-        payload: message.payload,
-        error: message.error,
-      });
+
+      if (message.ok) {
+        pendingHostCommand.resolve(message.payload);
+      } else {
+        pendingHostCommand.reject(new Error(message.error?.message ?? "host_error"));
+      }
     }
   });
 
@@ -697,6 +1048,11 @@ hostWsServer.on("connection", async (socket, req) => {
     for (const [id, pending] of pendingResponses.entries()) {
       if (pending.gatewayId === gatewayIdValue) {
         failPending(id, "gateway_offline", "Gateway disconnected before responding");
+      }
+    }
+    for (const [id, pending] of pendingHostCommands.entries()) {
+      if (pending.gatewayId === gatewayIdValue) {
+        failPendingHostCommand(id, "gateway_offline", "Gateway disconnected before responding");
       }
     }
     await persist();
@@ -833,6 +1189,28 @@ mobileWsServer.on("connection", async (socket, req) => {
       paramsMasked,
       riskLevel,
     });
+
+    if (method === "chat.send" || method === "agent") {
+      const params = message.params as Record<string, unknown> | null;
+      const text = params && typeof params.message === "string" ? params.message.trim() : "";
+      const sessionKeyValue = params && typeof params.sessionKey === "string" ? params.sessionKey : undefined;
+      if (text) {
+        broadcastToGatewayMembers(gatewayIdValue, {
+          type: "event",
+          gatewayId: gatewayIdValue,
+          event: "chat",
+          payload: {
+            state: "final",
+            role: "user",
+            sessionKey: sessionKeyValue,
+            runId: requestId,
+            message: {
+              content: [{ type: "text", text }],
+            },
+          },
+        }, socket);
+      }
+    }
 
     sendSocket(host.socket, {
       type: "cmd",
