@@ -227,41 +227,8 @@ function buildGatewaySummary(gateway: GatewayRecord) {
     mobileControlStatus: runtime.mobileControlStatus,
     lastSeenAt: gateway.lastSeenAt ?? gateway.createdAt,
     currentModel: runtime.currentModel ?? "--",
-    contextUsage: formatContextUsage(runtime.contextUsage),
+    contextUsage: "--",
   };
-}
-
-function formatContextUsage(value?: number): string {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    return "--";
-  }
-  return `${Math.round(value / 1000)}k/272k`;
-}
-
-function extractContextUsage(payload: unknown): number | undefined {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return undefined;
-  }
-  const source = payload as Record<string, unknown>;
-  const directKeys = ["contextUsage", "inputTokens", "promptTokens", "input_tokens", "prompt_tokens"];
-  for (const key of directKeys) {
-    const value = source[key];
-    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-      return value;
-    }
-  }
-  const usage = source.usage;
-  if (usage && typeof usage === "object" && !Array.isArray(usage)) {
-    const usageRecord = usage as Record<string, unknown>;
-    const usageKeys = ["inputTokens", "promptTokens", "input_tokens", "prompt_tokens"];
-    for (const key of usageKeys) {
-      const value = usageRecord[key];
-      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
-        return value;
-      }
-    }
-  }
-  return undefined;
 }
 
 function sendSocket(socket: WebSocket, envelope: RelayEnvelope): void {
@@ -1273,7 +1240,6 @@ hostWsServer.on("connection", async (socket, req) => {
       touchGateway(gatewayIdValue, {
         lastSeenAt: nowIso(),
         currentModel,
-        contextUsage: extractContextUsage(message.payload),
       });
       await persist();
       broadcastToGatewayMembers(gatewayIdValue, {
