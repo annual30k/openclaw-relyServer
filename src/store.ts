@@ -1,4 +1,7 @@
 import mysql, { type Pool, type RowDataPacket } from "mysql2/promise";
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import type {
   ApprovalRecord,
   CommandAuditLogRecord,
@@ -21,6 +24,9 @@ const EMPTY_STATE: RelayState = {
   commandAuditLogs: [],
   approvals: [],
 };
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 function toSqlDate(value?: string): string | null {
   if (!value) return null;
@@ -122,17 +128,21 @@ export class RelayStore {
   }
 
   private async ensureSchema(): Promise<void> {
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id VARCHAR(64) NOT NULL,
-        email VARCHAR(255) NOT NULL,
-        password_hash TEXT NOT NULL,
-        name VARCHAR(255) NOT NULL,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
+    const schemaPath = join(__dirname, "..", "mysql", "init", "001_schema.sql");
+    const schemaSql = readFileSync(schemaPath, "utf8");
+    const statements = schemaSql
+      .split(/;\s*(?:\r?\n|$)/)
+      .map((statement) => statement.trim())
+      .filter((statement) => statement.length > 0)
+      .filter((statement) => {
+        const upper = statement.toUpperCase();
+        return !upper.startsWith("CREATE DATABASE ") && !upper.startsWith("USE ");
+      });
+
+    for (const statement of statements) {
+      await this.pool.query(statement);
+    }
+
     const [userColumns] = await this.pool.query<RowDataPacket[]>(
       "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'",
     );
@@ -148,25 +158,6 @@ export class RelayStore {
       SET
         email = COALESCE(NULLIF(email, ''), CONCAT(id, '@local.invalid')),
         password_hash = COALESCE(password_hash, '')
-    `);
-    await this.pool.query(`
-      CREATE TABLE IF NOT EXISTS approvals (
-        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-        gateway_id VARCHAR(64) NOT NULL,
-        user_id VARCHAR(64) NOT NULL,
-        method VARCHAR(128) NOT NULL,
-        expires_at DATETIME NOT NULL,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uk_approvals_gateway_user_method (gateway_id, user_id, method),
-        KEY idx_approvals_expires_at (expires_at),
-        CONSTRAINT fk_approvals_gateway
-          FOREIGN KEY (gateway_id) REFERENCES gateways (id)
-          ON DELETE CASCADE,
-        CONSTRAINT fk_approvals_user
-          FOREIGN KEY (user_id) REFERENCES users (id)
-          ON DELETE CASCADE
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
   }
 

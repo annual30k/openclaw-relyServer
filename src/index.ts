@@ -339,6 +339,24 @@ async function persist(): Promise<void> {
   await store.save();
 }
 
+let scheduledPersistTimer: NodeJS.Timeout | undefined;
+let scheduledPersistTask: Promise<void> | undefined;
+
+function schedulePersist(delayMs = 250): void {
+  if (scheduledPersistTimer) return;
+  scheduledPersistTimer = setTimeout(() => {
+    scheduledPersistTimer = undefined;
+    scheduledPersistTask = persist()
+      .catch((error) => {
+        console.error("[relay] async persist failed", error);
+      })
+      .finally(() => {
+        scheduledPersistTask = undefined;
+      });
+  }, delayMs);
+  scheduledPersistTimer.unref?.();
+}
+
 function issueAccessCode(): string {
   const snapshot = store.snapshot();
   const now = nowIso();
@@ -688,7 +706,7 @@ async function handleGatewayModels(req: IncomingMessage, res: ServerResponse, ga
       openclawStatus: "healthy",
       lastSeenAt: nowIso(),
     });
-    await persist();
+    schedulePersist();
     const result = (payload ?? {}) as { items?: unknown[] };
     const runtime = normalizeGatewayRuntime(gatewayIdValue);
     const currentModel = runtime.currentModel;
@@ -732,7 +750,7 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
       openclawStatus: "healthy",
       lastSeenAt: nowIso(),
     });
-    await persist();
+    schedulePersist();
     const result = (payload ?? {}) as { messages?: unknown[] };
     const items = Array.isArray(result.messages)
       ? result.messages.flatMap((entry, index) => {
@@ -797,7 +815,7 @@ async function handleGatewayChatSessions(req: IncomingMessage, res: ServerRespon
       openclawStatus: "healthy",
       lastSeenAt: nowIso(),
     });
-    await persist();
+    schedulePersist();
 
     const payloadRecord = (payload && typeof payload === "object" && !Array.isArray(payload))
       ? (payload as Record<string, unknown>)
@@ -935,7 +953,7 @@ async function handleGatewayModelSelect(req: IncomingMessage, res: ServerRespons
       currentModel: modelAlias,
       lastSeenAt: nowIso(),
     });
-    await persist();
+    schedulePersist();
 
     const gateway = store.snapshot().gateways[gatewayIdValue];
     if (gateway) {
@@ -1018,105 +1036,116 @@ function metricsText(): string {
   ].join("\n");
 }
 
-const server = createServer(async (req, res) => {
-  const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-  const clientIp = (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0]?.trim() ?? req.socket.remoteAddress ?? "unknown";
+const server = createServer((req, res) => {
+  void (async () => {
+    try {
+      const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+      const clientIp = (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0]?.trim() ?? req.socket.remoteAddress ?? "unknown";
 
-  if (!ensureRateLimit("http", clientIp)) {
-    json(res, 429, { error: "rate_limited" });
-    return;
-  }
+      if (!ensureRateLimit("http", clientIp)) {
+        json(res, 429, { error: "rate_limited" });
+        return;
+      }
 
-  if (req.method === "GET" && requestUrl.pathname === "/healthz") {
-    json(res, 200, { ok: true, status: "healthy", now: nowIso() });
-    return;
-  }
+      if (req.method === "GET" && requestUrl.pathname === "/healthz") {
+        json(res, 200, { ok: true, status: "healthy", now: nowIso() });
+        return;
+      }
 
-  if (req.method === "GET" && requestUrl.pathname === "/metrics") {
-    text(res, 200, metricsText(), "text/plain; version=0.0.4; charset=utf-8");
-    return;
-  }
+      if (req.method === "GET" && requestUrl.pathname === "/metrics") {
+        text(res, 200, metricsText(), "text/plain; version=0.0.4; charset=utf-8");
+        return;
+      }
 
-  if (req.method === "POST" && requestUrl.pathname === "/api/relay/register") {
-    await handleRegister(req, res);
-    return;
-  }
+      if (req.method === "POST" && requestUrl.pathname === "/api/relay/register") {
+        await handleRegister(req, res);
+        return;
+      }
 
-  if (req.method === "POST" && requestUrl.pathname === "/api/auth/register") {
-    await handleAuthRegister(req, res);
-    return;
-  }
+      if (req.method === "POST" && requestUrl.pathname === "/api/auth/register") {
+        await handleAuthRegister(req, res);
+        return;
+      }
 
-  if (req.method === "POST" && requestUrl.pathname === "/api/auth/login") {
-    await handleAuthLogin(req, res);
-    return;
-  }
+      if (req.method === "POST" && requestUrl.pathname === "/api/auth/login") {
+        await handleAuthLogin(req, res);
+        return;
+      }
 
-  if (
-    req.method === "POST" &&
-    (requestUrl.pathname === "/api/relay/access-code" || requestUrl.pathname === "/api/relay/accesscode")
-  ) {
-    await handleAccessCode(req, res);
-    return;
-  }
+      if (
+        req.method === "POST" &&
+        (requestUrl.pathname === "/api/relay/access-code" || requestUrl.pathname === "/api/relay/accesscode")
+      ) {
+        await handleAccessCode(req, res);
+        return;
+      }
 
-  if (req.method === "POST" && requestUrl.pathname === "/api/mobile/pair") {
-    await handleMobilePair(req, res);
-    return;
-  }
+      if (req.method === "POST" && requestUrl.pathname === "/api/mobile/pair") {
+        await handleMobilePair(req, res);
+        return;
+      }
 
-  if (req.method === "GET" && requestUrl.pathname === "/api/mobile/gateways") {
-    await handleGatewayList(req, res);
-    return;
-  }
+      if (req.method === "GET" && requestUrl.pathname === "/api/mobile/gateways") {
+        await handleGatewayList(req, res);
+        return;
+      }
 
-  const detailMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)$/);
-  if (detailMatch && req.method === "GET") {
-    await handleGatewayDetail(req, res, detailMatch[1]);
-    return;
-  }
-  if (detailMatch && req.method === "DELETE") {
-    await handleGatewayDelete(req, res, detailMatch[1]);
-    return;
-  }
+      const detailMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)$/);
+      if (detailMatch && req.method === "GET") {
+        await handleGatewayDetail(req, res, detailMatch[1]);
+        return;
+      }
+      if (detailMatch && req.method === "DELETE") {
+        await handleGatewayDelete(req, res, detailMatch[1]);
+        return;
+      }
 
-  const modelsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models$/);
-  if (modelsMatch && req.method === "GET") {
-    await handleGatewayModels(req, res, modelsMatch[1]);
-    return;
-  }
+      const modelsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models$/);
+      if (modelsMatch && req.method === "GET") {
+        await handleGatewayModels(req, res, modelsMatch[1]);
+        return;
+      }
 
-  const chatHistoryMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/history$/);
-  if (chatHistoryMatch && req.method === "GET") {
-    await handleGatewayChatHistory(req, res, chatHistoryMatch[1], requestUrl);
-    return;
-  }
+      const chatHistoryMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/history$/);
+      if (chatHistoryMatch && req.method === "GET") {
+        await handleGatewayChatHistory(req, res, chatHistoryMatch[1], requestUrl);
+        return;
+      }
 
-  const chatSessionsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/sessions$/);
-  if (chatSessionsMatch && req.method === "GET") {
-    await handleGatewayChatSessions(req, res, chatSessionsMatch[1], requestUrl);
-    return;
-  }
+      const chatSessionsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/sessions$/);
+      if (chatSessionsMatch && req.method === "GET") {
+        await handleGatewayChatSessions(req, res, chatSessionsMatch[1], requestUrl);
+        return;
+      }
 
-  const modelSelectMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models\/select$/);
-  if (modelSelectMatch && req.method === "POST") {
-    await handleGatewayModelSelect(req, res, modelSelectMatch[1]);
-    return;
-  }
+      const modelSelectMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models\/select$/);
+      if (modelSelectMatch && req.method === "POST") {
+        await handleGatewayModelSelect(req, res, modelSelectMatch[1]);
+        return;
+      }
 
-  const defaultModelSelectMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models\/default$/);
-  if (defaultModelSelectMatch && req.method === "POST") {
-    await handleGatewayDefaultModelSelect(req, res, defaultModelSelectMatch[1]);
-    return;
-  }
+      const defaultModelSelectMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models\/default$/);
+      if (defaultModelSelectMatch && req.method === "POST") {
+        await handleGatewayDefaultModelSelect(req, res, defaultModelSelectMatch[1]);
+        return;
+      }
 
-  const approvalMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/approve-sensitive-action$/);
-  if (approvalMatch && req.method === "POST") {
-    await handleApproveSensitiveAction(req, res, approvalMatch[1]);
-    return;
-  }
+      const approvalMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/approve-sensitive-action$/);
+      if (approvalMatch && req.method === "POST") {
+        await handleApproveSensitiveAction(req, res, approvalMatch[1]);
+        return;
+      }
 
-  json(res, 404, { error: "not_found" });
+      json(res, 404, { error: "not_found" });
+    } catch (error) {
+      console.error("[relay] http handler failed", error);
+      if (!res.headersSent) {
+        json(res, 500, { error: "internal_error" });
+        return;
+      }
+      res.end();
+    }
+  })();
 });
 
 server.on("upgrade", (req, socket, head) => {
@@ -1159,7 +1188,7 @@ hostWsServer.on("connection", async (socket, req) => {
     hostStatus: "relay_connected",
     lastSeenAt: nowIso(),
   });
-  await persist();
+  schedulePersist();
 
   broadcastToGatewayMembers(gatewayIdValue, {
     type: "presence",
@@ -1187,7 +1216,7 @@ hostWsServer.on("connection", async (socket, req) => {
         hostStatus: "connecting_openclaw",
         lastSeenAt: nowIso(),
       });
-      await persist();
+      schedulePersist();
       sendSocket(socket, { type: "hello", role: "relay", gatewayId: gatewayIdValue, ok: true });
       return;
     }
@@ -1204,7 +1233,7 @@ hostWsServer.on("connection", async (socket, req) => {
         openclawStatus: "healthy",
         lastSeenAt: nowIso(),
       });
-      await persist();
+      schedulePersist();
       broadcastToGatewayMembers(gatewayIdValue, { type: "presence", gatewayId: gatewayIdValue, payload: buildGatewaySummary(gateway) });
       return;
     }
@@ -1216,7 +1245,7 @@ hostWsServer.on("connection", async (socket, req) => {
         openclawStatus: "degraded",
         lastSeenAt: nowIso(),
       });
-      await persist();
+      schedulePersist();
       broadcastToGatewayMembers(gatewayIdValue, {
         type: "event",
         gatewayId: gatewayIdValue,
@@ -1241,7 +1270,7 @@ hostWsServer.on("connection", async (socket, req) => {
         lastSeenAt: nowIso(),
         currentModel,
       });
-      await persist();
+      schedulePersist();
       broadcastToGatewayMembers(gatewayIdValue, {
         type: "event",
         gatewayId: gatewayIdValue,
@@ -1276,7 +1305,6 @@ hostWsServer.on("connection", async (socket, req) => {
           durationMs: Date.now() - pending.startedAt,
           createdAt: nowIso(),
         });
-        await persist();
         sendSocket(pending.socket, {
           type: "res",
           id: message.id,
@@ -1285,6 +1313,7 @@ hostWsServer.on("connection", async (socket, req) => {
           payload: message.payload,
           error: message.error,
         });
+        schedulePersist();
         return;
       }
 
@@ -1314,7 +1343,7 @@ hostWsServer.on("connection", async (socket, req) => {
         durationMs: Date.now() - pendingHostCommand.startedAt,
         createdAt: nowIso(),
       });
-      await persist();
+      schedulePersist();
 
       if (message.ok) {
         pendingHostCommand.resolve(message.payload);
@@ -1346,7 +1375,7 @@ hostWsServer.on("connection", async (socket, req) => {
         failPendingHostCommand(id, "gateway_offline", "Gateway disconnected before responding");
       }
     }
-    await persist();
+    schedulePersist();
     broadcastToGatewayMembers(gatewayIdValue, {
       type: "presence",
       gatewayId: gatewayIdValue,
@@ -1381,7 +1410,7 @@ mobileWsServer.on("connection", async (socket, req) => {
     device.lastSeenAt = nowIso();
     store.putMobileDevice(device);
   }
-  await persist();
+  schedulePersist();
 
   sendSocket(socket, {
     type: "hello",
@@ -1443,7 +1472,7 @@ mobileWsServer.on("connection", async (socket, req) => {
     if (requiresApproval(method) && !store.consumeApproval(gatewayIdValue, claims.userId, method, nowIso())) {
       metrics.commandFailures += 1;
       sendSocket(socket, { type: "res", id: message.id, gatewayId: gatewayIdValue, ok: false, error: { code: "approval_required", message: "Sensitive command requires approval" } });
-      await persist();
+      schedulePersist();
       return;
     }
 
@@ -1521,7 +1550,7 @@ mobileWsServer.on("connection", async (socket, req) => {
       method,
       params: message.params,
     });
-    await persist();
+    schedulePersist();
   });
 
   socket.on("close", async () => {
@@ -1535,7 +1564,7 @@ mobileWsServer.on("connection", async (socket, req) => {
         store.putRuntimeState(runtime);
       }
     }
-    await persist();
+    schedulePersist();
   });
 });
 
@@ -1559,7 +1588,7 @@ setInterval(async () => {
   }
   metrics.hostConnections = hostSessions.size;
   metrics.mobileConnections = mobileSessions.size;
-  await persist();
+  schedulePersist(config.heartbeatIntervalMs);
 }, config.heartbeatIntervalMs).unref();
 
 server.listen(config.port, config.host, () => {
