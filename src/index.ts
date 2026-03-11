@@ -772,6 +772,12 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
           if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
           const record = entry as Record<string, unknown>;
           const role = typeof record.role === "string" ? record.role : "assistant";
+          const createdAt =
+            normalizeSessionTimestamp(record.createdAt)
+            ?? normalizeSessionTimestamp(record.created_at)
+            ?? normalizeSessionTimestamp(record.timestamp)
+            ?? normalizeSessionTimestamp(record.ts)
+            ?? normalizeSessionTimestamp(record.time);
           const content = Array.isArray(record.content)
             ? record.content
                 .filter((block): block is Record<string, unknown> => Boolean(block) && typeof block === "object" && !Array.isArray(block))
@@ -785,9 +791,91 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
             id: `history-${index}`,
             role,
             content,
+            createdAt,
           }];
         })
       : [];
+    json(res, 200, { items });
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
+function normalizeSessionTimestamp(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    const millis = value > 10_000_000_000 ? value : value * 1000;
+    return new Date(millis).toISOString();
+  }
+  return undefined;
+}
+
+async function handleGatewayChatSessions(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string, requestUrl: URL): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+
+  const requestedLimit = Number.parseInt(requestUrl.searchParams.get("limit") ?? "20", 10);
+  const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 100)) : 20;
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "chat.list", { limit });
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    await persist();
+
+    const payloadRecord = (payload && typeof payload === "object" && !Array.isArray(payload))
+      ? (payload as Record<string, unknown>)
+      : undefined;
+    const rawItems =
+      Array.isArray(payloadRecord?.items) ? payloadRecord.items
+        : Array.isArray(payloadRecord?.sessions) ? payloadRecord.sessions
+          : Array.isArray(payloadRecord?.list) ? payloadRecord.list
+            : Array.isArray(payload) ? payload as unknown[]
+              : [];
+
+    const deduped = new Set<string>();
+    const items = rawItems.flatMap((entry) => {
+      if (typeof entry === "string") {
+        const sessionKey = entry.trim();
+        if (!sessionKey || deduped.has(sessionKey)) return [];
+        deduped.add(sessionKey);
+        return [{ sessionKey, lastActivityAt: undefined }];
+      }
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+      const record = entry as Record<string, unknown>;
+      const sessionKeyRaw =
+        typeof record.sessionKey === "string" ? record.sessionKey
+          : typeof record.key === "string" ? record.key
+            : typeof record.id === "string" ? record.id
+              : typeof record.session === "string" ? record.session
+                : undefined;
+      const sessionKey = sessionKeyRaw?.trim();
+      if (!sessionKey || deduped.has(sessionKey)) return [];
+      deduped.add(sessionKey);
+      const lastActivityAt =
+        normalizeSessionTimestamp(record.lastActivityAt)
+        ?? normalizeSessionTimestamp(record.lastMessageAt)
+        ?? normalizeSessionTimestamp(record.updatedAt)
+        ?? normalizeSessionTimestamp(record.lastSeenAt)
+        ?? normalizeSessionTimestamp(record.createdAt);
+      return [{ sessionKey, lastActivityAt }];
+    });
+
+    items.sort((a, b) => {
+      const aTime = a.lastActivityAt ? Date.parse(a.lastActivityAt) : 0;
+      const bTime = b.lastActivityAt ? Date.parse(b.lastActivityAt) : 0;
+      return bTime - aTime;
+    });
+
     json(res, 200, { items });
   } catch (error) {
     json(res, 502, { error: String(error) });
@@ -1034,6 +1122,12 @@ const server = createServer(async (req, res) => {
   const chatHistoryMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/history$/);
   if (chatHistoryMatch && req.method === "GET") {
     await handleGatewayChatHistory(req, res, chatHistoryMatch[1], requestUrl);
+    return;
+  }
+
+  const chatSessionsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/sessions$/);
+  if (chatSessionsMatch && req.method === "GET") {
+    await handleGatewayChatSessions(req, res, chatSessionsMatch[1], requestUrl);
     return;
   }
 
