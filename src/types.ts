@@ -13,6 +13,8 @@ export type RiskLevel = "L1" | "L2" | "L3";
 
 export interface UserRecord {
   id: string;
+  email: string;
+  passwordHash: string;
   name: string;
   createdAt: string;
 }

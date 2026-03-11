@@ -22,6 +22,7 @@ export interface AppConfig {
   approvalTtlSeconds: number;
   rateLimitWindowMs: number;
   rateLimitMax: number;
+  authTokenTtlSeconds: number;
 }
 
 export function loadConfig(): AppConfig {
@@ -41,5 +42,6 @@ export function loadConfig(): AppConfig {
     approvalTtlSeconds: intEnv("APPROVAL_TTL_SECONDS", 300),
     rateLimitWindowMs: intEnv("RATE_LIMIT_WINDOW_MS", 60000),
     rateLimitMax: intEnv("RATE_LIMIT_MAX", 120),
+    authTokenTtlSeconds: intEnv("AUTH_TOKEN_TTL_SECONDS", 60 * 60 * 24 * 30),
   };
 }

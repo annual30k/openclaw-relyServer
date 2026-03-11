@@ -38,7 +38,7 @@ function toIso(value: unknown): string | undefined {
   return stringValue.includes("T") ? stringValue : `${stringValue.replace(" ", "T")}Z`;
 }
 
-type UserRow = RowDataPacket & { id: string; name: string; created_at: string };
+type UserRow = RowDataPacket & { id: string; email: string | null; password_hash: string | null; name: string; created_at: string };
 type MobileDeviceRow = RowDataPacket & {
   id: string;
   user_id: string;
@@ -123,6 +123,33 @@ export class RelayStore {
 
   private async ensureSchema(): Promise<void> {
     await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(64) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        password_hash TEXT NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+    const [userColumns] = await this.pool.query<RowDataPacket[]>(
+      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users'",
+    );
+    const userColumnSet = new Set(userColumns.map((row) => String(row.COLUMN_NAME)));
+    if (!userColumnSet.has("email")) {
+      await this.pool.query("ALTER TABLE users ADD COLUMN email VARCHAR(255) NULL");
+    }
+    if (!userColumnSet.has("password_hash")) {
+      await this.pool.query("ALTER TABLE users ADD COLUMN password_hash TEXT NULL");
+    }
+    await this.pool.query(`
+      UPDATE users
+      SET
+        email = COALESCE(NULLIF(email, ''), CONCAT(id, '@local.invalid')),
+        password_hash = COALESCE(password_hash, '')
+    `);
+    await this.pool.query(`
       CREATE TABLE IF NOT EXISTS approvals (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         gateway_id VARCHAR(64) NOT NULL,
@@ -144,7 +171,7 @@ export class RelayStore {
   }
 
   private async load(): Promise<void> {
-    const [users] = await this.pool.query<UserRow[]>("SELECT id, name, created_at FROM users");
+    const [users] = await this.pool.query<UserRow[]>("SELECT id, email, password_hash, name, created_at FROM users");
     const [devices] = await this.pool.query<MobileDeviceRow[]>(
       "SELECT id, user_id, platform, app_version, created_at, last_seen_at FROM mobile_devices",
     );
@@ -172,6 +199,8 @@ export class RelayStore {
     for (const row of users) {
       this.state.users[row.id] = {
         id: row.id,
+        email: row.email ?? `${row.id}@local.invalid`,
+        passwordHash: row.password_hash ?? "",
         name: row.name,
         createdAt: toIso(row.created_at) ?? new Date().toISOString(),
       };
@@ -277,8 +306,8 @@ export class RelayStore {
 
         for (const user of Object.values(this.state.users)) {
           await conn.query(
-            "INSERT INTO users (id, name, created_at, updated_at) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), updated_at = VALUES(updated_at)",
-            [user.id, user.name, toSqlDate(user.createdAt), toSqlDate(new Date().toISOString())],
+            "INSERT INTO users (id, email, password_hash, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE email = VALUES(email), password_hash = VALUES(password_hash), name = VALUES(name), updated_at = VALUES(updated_at)",
+            [user.id, user.email, user.passwordHash, user.name, toSqlDate(user.createdAt), toSqlDate(new Date().toISOString())],
           );
         }
 

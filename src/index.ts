@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { randomUUID } from "crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import { loadConfig } from "./config.js";
-import { addSeconds, gatewayCode, gatewayId, maskSensitive, nowIso, randomCode, randomSecret, safeJsonParse, sha256, signToken, verifyToken } from "./security.js";
+import { addSeconds, gatewayCode, gatewayId, hashPassword, maskSensitive, nowIso, randomCode, randomSecret, safeJsonParse, sha256, signToken, verifyPassword, verifyToken } from "./security.js";
 import { classifyRisk, isReadOnly, requiresApproval } from "./risk.js";
 import { RelayStore } from "./store.js";
 import type {
@@ -77,6 +77,7 @@ type TokenClaims = {
   platform: string;
   appVersion?: string;
   exp: string;
+  email?: string;
 };
 
 const hostSessions = new Map<string, HostSession>();
@@ -148,25 +149,55 @@ function getMembership(gatewayIdValue: string, userId: string): GatewayMembershi
   );
 }
 
-function getUserIdFromRequest(req: IncomingMessage, body?: Record<string, unknown> | null): string {
+function getUserIdFromRequest(req: IncomingMessage): string | null {
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) {
     const claims = verifyToken<TokenClaims>(auth.slice("Bearer ".length), config.jwtSecret);
-    if (claims && claims.exp > nowIso()) return claims.userId;
+    if (claims && claims.exp > nowIso() && typeof claims.userId === "string" && claims.userId) {
+      return claims.userId;
+    }
   }
-  const headerId = req.headers["x-user-id"];
-  if (typeof headerId === "string" && headerId.trim()) return headerId.trim();
-  const bodyId = body?.userId;
-  if (typeof bodyId === "string" && bodyId.trim()) return bodyId.trim();
-  return "demo-user";
+  return null;
 }
 
 function ensureUser(userId: string): UserRecord {
   const existing = store.snapshot().users[userId];
   if (existing) return existing;
-  const user: UserRecord = { id: userId, name: userId, createdAt: nowIso() };
+  const user: UserRecord = { id: userId, email: `${userId}@local.invalid`, passwordHash: "", name: userId, createdAt: nowIso() };
   store.putUser(user);
   return user;
+}
+
+function makeAccessToken(user: UserRecord, deviceId: string, platform: string, appVersion: string): string {
+  return signToken(
+    {
+      userId: user.id,
+      email: user.email,
+      deviceId,
+      platform,
+      appVersion,
+      exp: addSeconds(new Date(), config.authTokenTtlSeconds),
+    },
+    config.jwtSecret,
+  );
+}
+
+function findUserByEmail(email: string): UserRecord | undefined {
+  const normalized = normalizeEmail(email);
+  return Object.values(store.snapshot().users).find((user) => user.email.toLowerCase() === normalized);
+}
+
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function requireAuthenticatedUser(req: IncomingMessage, res: ServerResponse): string | null {
+  const userId = getUserIdFromRequest(req);
+  if (!userId) {
+    json(res, 401, { error: "unauthorized" });
+    return null;
+  }
+  return userId;
 }
 
 function ensureRateLimit(scope: string, key: string): boolean {
@@ -196,8 +227,41 @@ function buildGatewaySummary(gateway: GatewayRecord) {
     mobileControlStatus: runtime.mobileControlStatus,
     lastSeenAt: gateway.lastSeenAt ?? gateway.createdAt,
     currentModel: runtime.currentModel ?? "--",
-    contextUsage: runtime.contextUsage ?? 0,
+    contextUsage: formatContextUsage(runtime.contextUsage),
   };
+}
+
+function formatContextUsage(value?: number): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return "--";
+  }
+  return `${Math.round(value / 1000)}k/272k`;
+}
+
+function extractContextUsage(payload: unknown): number | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+  const source = payload as Record<string, unknown>;
+  const directKeys = ["contextUsage", "inputTokens", "promptTokens", "input_tokens", "prompt_tokens"];
+  for (const key of directKeys) {
+    const value = source[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return value;
+    }
+  }
+  const usage = source.usage;
+  if (usage && typeof usage === "object" && !Array.isArray(usage)) {
+    const usageRecord = usage as Record<string, unknown>;
+    const usageKeys = ["inputTokens", "promptTokens", "input_tokens", "prompt_tokens"];
+    for (const key of usageKeys) {
+      const value = usageRecord[key];
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        return value;
+      }
+    }
+  }
+  return undefined;
 }
 
 function sendSocket(socket: WebSocket, envelope: RelayEnvelope): void {
@@ -308,6 +372,38 @@ async function persist(): Promise<void> {
   await store.save();
 }
 
+function issueAccessCode(): string {
+  const snapshot = store.snapshot();
+  const now = nowIso();
+  for (let attempts = 0; attempts < 20; attempts += 1) {
+    const accessCode = randomCode();
+    const accessCodeHash = sha256(accessCode);
+    const isDuplicate = Object.values(snapshot.gatewayPairingCodes).some(
+      (record) => !record.usedAt && record.expiresAt > now && record.accessCodeHash === accessCodeHash,
+    );
+    if (!isDuplicate) {
+      return accessCode;
+    }
+  }
+  throw new Error("failed_to_issue_unique_access_code");
+}
+
+function findPairingCodeByAccessCode(accessCode: string): { gateway: GatewayRecord; pairingCode: { gatewayId: string; accessCodeHash: string; expiresAt: string; usedAt?: string; createdAt: string } } | null {
+  const accessCodeHash = sha256(accessCode);
+  const snapshot = store.snapshot();
+  for (const pairingCode of Object.values(snapshot.gatewayPairingCodes)) {
+    if (pairingCode.accessCodeHash !== accessCodeHash) {
+      continue;
+    }
+    const gateway = snapshot.gateways[pairingCode.gatewayId];
+    if (!gateway) {
+      continue;
+    }
+    return { gateway, pairingCode };
+  }
+  return null;
+}
+
 async function handleRegister(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
   const displayName = typeof body.displayName === "string" && body.displayName.trim() ? body.displayName.trim() : "PocketClaw Host";
@@ -338,7 +434,7 @@ async function handleRegister(req: IncomingMessage, res: ServerResponse): Promis
     mobileControlStatus: "idle",
   });
 
-  const accessCode = randomCode();
+  const accessCode = issueAccessCode();
   store.putPairingCode({
     gatewayId: id,
     accessCodeHash: sha256(accessCode),
@@ -366,7 +462,7 @@ async function handleAccessCode(req: IncomingMessage, res: ServerResponse): Prom
     return;
   }
 
-  const accessCode = randomCode();
+  const accessCode = issueAccessCode();
   const expiresAt = addSeconds(new Date(), config.accessCodeTtlSeconds);
   store.putPairingCode({
     gatewayId: gatewayIdValue,
@@ -378,6 +474,84 @@ async function handleAccessCode(req: IncomingMessage, res: ServerResponse): Prom
   json(res, 200, { gatewayId: gatewayIdValue, accessCode, expiresAt });
 }
 
+async function handleAuthRegister(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+  const password = typeof body.password === "string" ? body.password : "";
+  const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : email;
+  const deviceId = typeof body.deviceId === "string" && body.deviceId.trim() ? body.deviceId.trim() : `ios_${randomUUID().slice(0, 8)}`;
+  const platform = typeof body.platform === "string" ? body.platform : "ios";
+  const appVersion = typeof body.appVersion === "string" ? body.appVersion : "unknown";
+
+  if (!email || !email.includes("@")) {
+    json(res, 400, { error: "valid_email_required" });
+    return;
+  }
+  if (password.length < 8) {
+    json(res, 400, { error: "password_too_short" });
+    return;
+  }
+  if (findUserByEmail(email)) {
+    json(res, 409, { error: "email_already_registered" });
+    return;
+  }
+
+  const user: UserRecord = {
+    id: `user_${randomUUID().replace(/-/g, "").slice(0, 12)}`,
+    email,
+    passwordHash: hashPassword(password),
+    name,
+    createdAt: nowIso(),
+  };
+  store.putUser(user);
+  store.putMobileDevice({
+    id: deviceId,
+    userId: user.id,
+    platform,
+    appVersion,
+    createdAt: nowIso(),
+    lastSeenAt: nowIso(),
+  });
+  await persist();
+
+  json(res, 200, {
+    accessToken: makeAccessToken(user, deviceId, platform, appVersion),
+    user: { id: user.id, email: user.email, name: user.name },
+    deviceId,
+  });
+}
+
+async function handleAuthLogin(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+  const password = typeof body.password === "string" ? body.password : "";
+  const deviceId = typeof body.deviceId === "string" && body.deviceId.trim() ? body.deviceId.trim() : `ios_${randomUUID().slice(0, 8)}`;
+  const platform = typeof body.platform === "string" ? body.platform : "ios";
+  const appVersion = typeof body.appVersion === "string" ? body.appVersion : "unknown";
+  const user = findUserByEmail(email);
+
+  if (!user || !verifyPassword(password, user.passwordHash)) {
+    json(res, 401, { error: "invalid_credentials" });
+    return;
+  }
+
+  store.putMobileDevice({
+    id: deviceId,
+    userId: user.id,
+    platform,
+    appVersion,
+    createdAt: nowIso(),
+    lastSeenAt: nowIso(),
+  });
+  await persist();
+
+  json(res, 200, {
+    accessToken: makeAccessToken(user, deviceId, platform, appVersion),
+    user: { id: user.id, email: user.email, name: user.name },
+    deviceId,
+  });
+}
+
 async function handleMobilePair(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
   const gatewayIdValue = typeof body.gatewayId === "string" ? body.gatewayId : "";
@@ -385,8 +559,26 @@ async function handleMobilePair(req: IncomingMessage, res: ServerResponse): Prom
   const deviceId = typeof body.deviceId === "string" && body.deviceId.trim() ? body.deviceId.trim() : `ios_${randomUUID().slice(0, 8)}`;
   const platform = typeof body.platform === "string" ? body.platform : "ios";
   const appVersion = typeof body.appVersion === "string" ? body.appVersion : "unknown";
-  const gateway = store.snapshot().gateways[gatewayIdValue];
-  const pairingCode = store.snapshot().gatewayPairingCodes[gatewayIdValue];
+
+  let resolvedGatewayId = gatewayIdValue.trim();
+  let gateway = resolvedGatewayId ? store.snapshot().gateways[resolvedGatewayId] : undefined;
+  let pairingCode = resolvedGatewayId ? store.snapshot().gatewayPairingCodes[resolvedGatewayId] : undefined;
+
+  if (!accessCode.trim()) {
+    json(res, 400, { error: "pairing_code_required" });
+    return;
+  }
+
+  if (!resolvedGatewayId) {
+    const resolved = findPairingCodeByAccessCode(accessCode);
+    if (!resolved) {
+      json(res, 404, { error: "pairing_code_not_found" });
+      return;
+    }
+    resolvedGatewayId = resolved.gateway.id;
+    gateway = resolved.gateway;
+    pairingCode = resolved.pairingCode;
+  }
 
   if (!gateway || !pairingCode) {
     json(res, 404, { error: "pairing_code_not_found" });
@@ -401,11 +593,25 @@ async function handleMobilePair(req: IncomingMessage, res: ServerResponse): Prom
     return;
   }
 
-  const userId = getUserIdFromRequest(req, body);
-  ensureUser(userId);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const user = store.snapshot().users[userId];
+  if (!user) {
+    json(res, 401, { error: "unknown_user" });
+    return;
+  }
 
-  const existingOwner = store.snapshot().gatewayMemberships.some((membership) => membership.gatewayId === gatewayIdValue && membership.role === "owner");
-  const role: Role = existingOwner ? "admin" : "owner";
+  const existingMembership = getMembership(resolvedGatewayId, userId);
+  const existingOwner = store.snapshot().gatewayMemberships.find((membership) => membership.gatewayId === resolvedGatewayId && membership.role === "owner");
+  let role: Role;
+  if (existingMembership) {
+    role = existingMembership.role;
+  } else if (!existingOwner) {
+    role = "owner";
+  } else {
+    json(res, 403, { error: "gateway_already_bound_to_another_account" });
+    return;
+  }
 
   if (!gateway.ownerUserId) {
     gateway.ownerUserId = userId;
@@ -413,12 +619,14 @@ async function handleMobilePair(req: IncomingMessage, res: ServerResponse): Prom
     store.putGateway(gateway);
   }
 
-  store.putMembership({
-    gatewayId: gatewayIdValue,
-    userId,
-    role,
-    createdAt: nowIso(),
-  });
+  if (!existingMembership) {
+    store.putMembership({
+      gatewayId: resolvedGatewayId,
+      userId,
+      role,
+      createdAt: nowIso(),
+    });
+  }
 
   const device: MobileDeviceRecord = {
     id: deviceId,
@@ -433,16 +641,7 @@ async function handleMobilePair(req: IncomingMessage, res: ServerResponse): Prom
   pairingCode.usedAt = nowIso();
   store.putPairingCode(pairingCode);
 
-  const accessToken = signToken(
-    {
-      userId,
-      deviceId,
-      platform,
-      appVersion,
-      exp: addSeconds(new Date(), 60 * 60 * 24 * 7),
-    },
-    config.jwtSecret,
-  );
+  const accessToken = makeAccessToken(user, deviceId, platform, appVersion);
 
   await persist();
   json(res, 200, {
@@ -455,8 +654,8 @@ async function handleMobilePair(req: IncomingMessage, res: ServerResponse): Prom
 }
 
 async function handleGatewayList(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const userId = getUserIdFromRequest(req, null);
-  ensureUser(userId);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
   const gateways = store.snapshot().gatewayMemberships
     .filter((membership) => membership.userId === userId)
     .map((membership) => {
@@ -468,7 +667,8 @@ async function handleGatewayList(req: IncomingMessage, res: ServerResponse): Pro
 }
 
 async function handleGatewayDetail(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
-  const userId = getUserIdFromRequest(req, null);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
   const membership = getMembership(gatewayIdValue, userId);
   const gateway = store.snapshot().gateways[gatewayIdValue];
   if (!membership || !gateway) {
@@ -485,7 +685,8 @@ async function handleGatewayDetail(req: IncomingMessage, res: ServerResponse, ga
 }
 
 async function handleGatewayDelete(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
-  const userId = getUserIdFromRequest(req, null);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
   const membership = getMembership(gatewayIdValue, userId);
   if (!membership) {
     json(res, 404, { error: "gateway_not_found" });
@@ -504,7 +705,8 @@ async function handleGatewayDelete(req: IncomingMessage, res: ServerResponse, ga
 }
 
 async function handleGatewayModels(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
-  const userId = getUserIdFromRequest(req, null);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
   const membership = getMembership(gatewayIdValue, userId);
   if (!membership) {
     json(res, 404, { error: "gateway_not_found" });
@@ -540,7 +742,8 @@ async function handleGatewayModels(req: IncomingMessage, res: ServerResponse, ga
 }
 
 async function handleGatewayChatHistory(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string, requestUrl: URL): Promise<void> {
-  const userId = getUserIdFromRequest(req, null);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
   const membership = getMembership(gatewayIdValue, userId);
   if (!membership) {
     json(res, 404, { error: "gateway_not_found" });
@@ -593,7 +796,8 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
 
 async function handleGatewayDefaultModelSelect(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
-  const userId = getUserIdFromRequest(req, body);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
   const membership = getMembership(gatewayIdValue, userId);
   if (!membership) {
     json(res, 404, { error: "gateway_not_found" });
@@ -644,7 +848,8 @@ async function handleGatewayDefaultModelSelect(req: IncomingMessage, res: Server
 
 async function handleGatewayModelSelect(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
-  const userId = getUserIdFromRequest(req, body);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
   const membership = getMembership(gatewayIdValue, userId);
   if (!membership) {
     json(res, 404, { error: "gateway_not_found" });
@@ -657,10 +862,11 @@ async function handleGatewayModelSelect(req: IncomingMessage, res: ServerRespons
 
   const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
   const modelId = typeof body.modelId === "string" ? body.modelId.trim() : "";
-  const modelAlias = typeof body.modelAlias === "string" ? body.modelAlias.trim() : "";
-  const modelName = typeof body.modelName === "string" ? body.modelName.trim() : modelAlias;
+  const modelAliasRaw = typeof body.modelAlias === "string" ? body.modelAlias.trim() : "";
+  const modelName = typeof body.modelName === "string" ? body.modelName.trim() : "";
+  const modelAlias = modelAliasRaw || modelName || modelId;
   if (!providerId || !modelId || !modelAlias) {
-    json(res, 400, { error: "providerId_modelId_and_modelAlias_required" });
+    json(res, 400, { error: "providerId_modelId_and_modelName_required" });
     return;
   }
 
@@ -705,7 +911,8 @@ async function handleGatewayModelSelect(req: IncomingMessage, res: ServerRespons
 
 async function handleApproveSensitiveAction(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
-  const userId = getUserIdFromRequest(req, body);
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
   const membership = getMembership(gatewayIdValue, userId);
   if (!membership || membership.role === "viewer") {
     json(res, 403, { error: "forbidden" });
@@ -777,6 +984,16 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/relay/register") {
     await handleRegister(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/auth/register") {
+    await handleAuthRegister(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/auth/login") {
+    await handleAuthLogin(req, res);
     return;
   }
 
@@ -949,7 +1166,21 @@ hostWsServer.on("connection", async (socket, req) => {
     }
 
     if (message.type === "event") {
-      touchGateway(gatewayIdValue, { lastSeenAt: nowIso() });
+      const payloadRecord =
+        message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
+          ? (message.payload as Record<string, unknown>)
+          : undefined;
+      const currentModel =
+        typeof payloadRecord?.currentModel === "string"
+          ? payloadRecord.currentModel
+          : typeof payloadRecord?.model === "string"
+            ? payloadRecord.model
+            : undefined;
+      touchGateway(gatewayIdValue, {
+        lastSeenAt: nowIso(),
+        currentModel,
+        contextUsage: extractContextUsage(message.payload),
+      });
       await persist();
       broadcastToGatewayMembers(gatewayIdValue, {
         type: "event",
@@ -1069,7 +1300,7 @@ mobileWsServer.on("connection", async (socket, req) => {
   const accessToken = requestUrl.searchParams.get("accessToken") ?? "";
   const claims = verifyToken<TokenClaims>(accessToken, config.jwtSecret);
 
-  if (!claims || claims.exp <= nowIso()) {
+  if (!claims || claims.exp <= nowIso() || typeof claims.deviceId !== "string" || !claims.deviceId) {
     socket.close(4401, "unauthorized");
     return;
   }
@@ -1176,6 +1407,17 @@ mobileWsServer.on("connection", async (socket, req) => {
       runtime.controllerUserId = claims.userId;
       runtime.controllerDeviceId = claims.deviceId;
       runtime.mobileControlStatus = "claimed";
+      if (method === "chat.send") {
+        const paramsRecord =
+          message.params && typeof message.params === "object" && !Array.isArray(message.params)
+            ? (message.params as Record<string, unknown>)
+            : undefined;
+        const text = typeof paramsRecord?.message === "string" ? paramsRecord.message.trim() : "";
+        const modelSwitchMatch = text.match(/^\/model\s+(.+)$/i);
+        if (modelSwitchMatch) {
+          runtime.currentModel = modelSwitchMatch[1].trim();
+        }
+      }
       store.putRuntimeState(runtime);
     }
 
