@@ -341,8 +341,13 @@ async function persist(): Promise<void> {
 
 let scheduledPersistTimer: NodeJS.Timeout | undefined;
 let scheduledPersistTask: Promise<void> | undefined;
+let persistRequestedWhileRunning = false;
 
 function schedulePersist(delayMs = 250): void {
+  if (scheduledPersistTask) {
+    persistRequestedWhileRunning = true;
+    return;
+  }
   if (scheduledPersistTimer) return;
   scheduledPersistTimer = setTimeout(() => {
     scheduledPersistTimer = undefined;
@@ -352,6 +357,10 @@ function schedulePersist(delayMs = 250): void {
       })
       .finally(() => {
         scheduledPersistTask = undefined;
+        if (persistRequestedWhileRunning) {
+          persistRequestedWhileRunning = false;
+          schedulePersist();
+        }
       });
   }, delayMs);
   scheduledPersistTimer.unref?.();

@@ -44,6 +44,13 @@ function toIso(value: unknown): string | undefined {
   return stringValue.includes("T") ? stringValue : `${stringValue.replace(" ", "T")}Z`;
 }
 
+function isClosedConnectionError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return code === "PROTOCOL_CONNECTION_LOST" || message.includes("closed state");
+}
+
 type UserRow = RowDataPacket & { id: string; email: string | null; password_hash: string | null; name: string; created_at: string };
 type MobileDeviceRow = RowDataPacket & {
   id: string;
@@ -281,7 +288,7 @@ export class RelayStore {
   }
 
   async save(): Promise<void> {
-    this.saveQueue = this.saveQueue.then(async () => {
+    this.saveQueue = this.saveQueue.catch(() => undefined).then(async () => {
       const conn = await this.pool.getConnection();
       try {
         await conn.beginTransaction();
@@ -413,7 +420,13 @@ export class RelayStore {
 
         await conn.commit();
       } catch (error) {
-        await conn.rollback();
+        try {
+          await conn.rollback();
+        } catch (rollbackError) {
+          if (!isClosedConnectionError(rollbackError)) {
+            console.error("[relay-store] rollback failed", rollbackError);
+          }
+        }
         throw error;
       } finally {
         conn.release();
