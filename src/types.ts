@@ -67,6 +67,7 @@ export interface GatewayRuntimeStateRecord {
   lastSeenAt?: string;
   currentModel?: string;
   contextUsage?: number;
+  contextLimit?: number;
   controllerUserId?: string;
   controllerDeviceId?: string;
   mobileControlStatus: MobileControlStatus;

@@ -95,6 +95,7 @@ type RuntimeRow = RowDataPacket & {
   aggregate_status: GatewayRuntimeStateRecord["aggregateStatus"];
   current_model: string | null;
   context_usage: number | null;
+  context_limit: number | null;
   controller_user_id: string | null;
   controller_device_id: string | null;
   mobile_control_status: GatewayRuntimeStateRecord["mobileControlStatus"];
@@ -160,6 +161,13 @@ export class RelayStore {
     if (!userColumnSet.has("password_hash")) {
       await this.pool.query("ALTER TABLE users ADD COLUMN password_hash TEXT NULL");
     }
+    const [runtimeColumns] = await this.pool.query<RowDataPacket[]>(
+      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'gateway_runtime_state'",
+    );
+    const runtimeColumnSet = new Set(runtimeColumns.map((row) => String(row.COLUMN_NAME)));
+    if (!runtimeColumnSet.has("context_limit")) {
+      await this.pool.query("ALTER TABLE gateway_runtime_state ADD COLUMN context_limit INT DEFAULT NULL AFTER context_usage");
+    }
     await this.pool.query(`
       UPDATE users
       SET
@@ -183,7 +191,7 @@ export class RelayStore {
       "SELECT gateway_id, user_id, role, created_at FROM gateway_memberships",
     );
     const [runtimeStates] = await this.pool.query<RuntimeRow[]>(
-      "SELECT gateway_id, relay_status, host_status, openclaw_status, aggregate_status, current_model, context_usage, controller_user_id, controller_device_id, mobile_control_status, last_seen_at FROM gateway_runtime_state",
+      "SELECT gateway_id, relay_status, host_status, openclaw_status, aggregate_status, current_model, context_usage, context_limit, controller_user_id, controller_device_id, mobile_control_status, last_seen_at FROM gateway_runtime_state",
     );
     const [auditLogs] = await this.pool.query<AuditRow[]>(
       "SELECT id, gateway_id, user_id, method, risk_level, params_masked, result_ok, error_code, duration_ms, created_at FROM command_audit_logs ORDER BY id DESC LIMIT 5000",
@@ -258,6 +266,7 @@ export class RelayStore {
         aggregateStatus: row.aggregate_status,
         currentModel: row.current_model ?? undefined,
         contextUsage: row.context_usage ?? undefined,
+        contextLimit: row.context_limit ?? undefined,
         controllerUserId: row.controller_user_id ?? undefined,
         controllerDeviceId: row.controller_device_id ?? undefined,
         mobileControlStatus: row.mobile_control_status,
@@ -289,147 +298,163 @@ export class RelayStore {
 
   async save(): Promise<void> {
     this.saveQueue = this.saveQueue.catch(() => undefined).then(async () => {
-      const conn = await this.pool.getConnection();
-      try {
-        await conn.beginTransaction();
-
-        await conn.query("DELETE FROM approvals");
-        await conn.query("DELETE FROM command_audit_logs");
-        await conn.query("DELETE FROM gateway_runtime_state");
-        await conn.query("DELETE FROM gateway_memberships");
-        await conn.query("DELETE FROM gateway_pairing_codes");
-        await conn.query("DELETE FROM mobile_devices");
-        await conn.query("DELETE FROM gateways");
-        await conn.query("DELETE FROM users");
-
-        for (const user of Object.values(this.state.users)) {
-          await conn.query(
-            "INSERT INTO users (id, email, password_hash, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE email = VALUES(email), password_hash = VALUES(password_hash), name = VALUES(name), updated_at = VALUES(updated_at)",
-            [user.id, user.email, user.passwordHash, user.name, toSqlDate(user.createdAt), toSqlDate(new Date().toISOString())],
-          );
-        }
-
-        for (const gateway of Object.values(this.state.gateways)) {
-          await conn.query(
-            "INSERT INTO gateways (id, owner_user_id, gateway_code, relay_secret_hash, display_name, platform, agent_version, openclaw_version, status, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-              gateway.id,
-              gateway.ownerUserId ?? null,
-              gateway.gatewayCode,
-              gateway.relaySecretHash,
-              gateway.displayName,
-              gateway.platform,
-              gateway.agentVersion,
-              gateway.openclawVersion ?? null,
-              gateway.status,
-              toSqlDate(gateway.lastSeenAt),
-              toSqlDate(gateway.createdAt),
-              toSqlDate(gateway.updatedAt),
-            ],
-          );
-        }
-
-        for (const device of Object.values(this.state.mobileDevices)) {
-          await conn.query(
-            "INSERT INTO mobile_devices (id, user_id, platform, app_version, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
-            [
-              device.id,
-              device.userId,
-              device.platform,
-              device.appVersion ?? null,
-              toSqlDate(device.createdAt),
-              toSqlDate(device.lastSeenAt),
-            ],
-          );
-        }
-
-        for (const code of Object.values(this.state.gatewayPairingCodes)) {
-          await conn.query(
-            "INSERT INTO gateway_pairing_codes (gateway_id, access_code_hash, expires_at, used_at, created_at) VALUES (?, ?, ?, ?, ?)",
-            [
-              code.gatewayId,
-              code.accessCodeHash,
-              toSqlDate(code.expiresAt),
-              toSqlDate(code.usedAt),
-              toSqlDate(code.createdAt),
-            ],
-          );
-        }
-
-        for (const membership of this.state.gatewayMemberships) {
-          await conn.query(
-            "INSERT INTO gateway_memberships (gateway_id, user_id, role, created_at) VALUES (?, ?, ?, ?)",
-            [
-              membership.gatewayId,
-              membership.userId,
-              membership.role,
-              toSqlDate(membership.createdAt),
-            ],
-          );
-        }
-
-        for (const runtime of Object.values(this.state.gatewayRuntimeState)) {
-          await conn.query(
-            "INSERT INTO gateway_runtime_state (gateway_id, relay_status, host_status, openclaw_status, aggregate_status, current_model, context_usage, controller_user_id, controller_device_id, mobile_control_status, last_seen_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-              runtime.gatewayId,
-              runtime.relayStatus,
-              runtime.hostStatus,
-              runtime.openclawStatus,
-              runtime.aggregateStatus,
-              runtime.currentModel ?? null,
-              runtime.contextUsage ?? null,
-              runtime.controllerUserId ?? null,
-              runtime.controllerDeviceId ?? null,
-              runtime.mobileControlStatus,
-              toSqlDate(runtime.lastSeenAt),
-              toSqlDate(new Date().toISOString()),
-            ],
-          );
-        }
-
-        for (const log of this.state.commandAuditLogs.slice(0, 5000)) {
-          await conn.query(
-            "INSERT INTO command_audit_logs (gateway_id, user_id, method, risk_level, params_masked, result_ok, error_code, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-              log.gatewayId,
-              log.userId,
-              log.method,
-              log.riskLevel,
-              log.paramsMasked,
-              log.resultOk ? 1 : 0,
-              log.errorCode ?? null,
-              log.durationMs,
-              toSqlDate(log.createdAt),
-            ],
-          );
-        }
-
-        for (const approval of this.state.approvals) {
-          await conn.query(
-            "INSERT INTO approvals (gateway_id, user_id, method, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
-            [
-              approval.gatewayId,
-              approval.userId,
-              approval.method,
-              toSqlDate(approval.expiresAt),
-              toSqlDate(approval.createdAt),
-            ],
-          );
-        }
-
-        await conn.commit();
-      } catch (error) {
+      const maxAttempts = 2;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const conn = await this.pool.getConnection();
+        let shouldDestroyConnection = false;
         try {
-          await conn.rollback();
-        } catch (rollbackError) {
-          if (!isClosedConnectionError(rollbackError)) {
-            console.error("[relay-store] rollback failed", rollbackError);
+          // Long-lived relay processes can pull a stale pooled connection after MySQL
+          // closes it underneath us. Ping first so we can retry with a fresh socket.
+          await conn.ping();
+          await conn.beginTransaction();
+
+          await conn.query("DELETE FROM approvals");
+          await conn.query("DELETE FROM command_audit_logs");
+          await conn.query("DELETE FROM gateway_runtime_state");
+          await conn.query("DELETE FROM gateway_memberships");
+          await conn.query("DELETE FROM gateway_pairing_codes");
+          await conn.query("DELETE FROM mobile_devices");
+          await conn.query("DELETE FROM gateways");
+          await conn.query("DELETE FROM users");
+
+          for (const user of Object.values(this.state.users)) {
+            await conn.query(
+              "INSERT INTO users (id, email, password_hash, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE email = VALUES(email), password_hash = VALUES(password_hash), name = VALUES(name), updated_at = VALUES(updated_at)",
+              [user.id, user.email, user.passwordHash, user.name, toSqlDate(user.createdAt), toSqlDate(new Date().toISOString())],
+            );
           }
+
+          for (const gateway of Object.values(this.state.gateways)) {
+            await conn.query(
+              "INSERT INTO gateways (id, owner_user_id, gateway_code, relay_secret_hash, display_name, platform, agent_version, openclaw_version, status, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              [
+                gateway.id,
+                gateway.ownerUserId ?? null,
+                gateway.gatewayCode,
+                gateway.relaySecretHash,
+                gateway.displayName,
+                gateway.platform,
+                gateway.agentVersion,
+                gateway.openclawVersion ?? null,
+                gateway.status,
+                toSqlDate(gateway.lastSeenAt),
+                toSqlDate(gateway.createdAt),
+                toSqlDate(gateway.updatedAt),
+              ],
+            );
+          }
+
+          for (const device of Object.values(this.state.mobileDevices)) {
+            await conn.query(
+              "INSERT INTO mobile_devices (id, user_id, platform, app_version, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+              [
+                device.id,
+                device.userId,
+                device.platform,
+                device.appVersion ?? null,
+                toSqlDate(device.createdAt),
+                toSqlDate(device.lastSeenAt),
+              ],
+            );
+          }
+
+          for (const code of Object.values(this.state.gatewayPairingCodes)) {
+            await conn.query(
+              "INSERT INTO gateway_pairing_codes (gateway_id, access_code_hash, expires_at, used_at, created_at) VALUES (?, ?, ?, ?, ?)",
+              [
+                code.gatewayId,
+                code.accessCodeHash,
+                toSqlDate(code.expiresAt),
+                toSqlDate(code.usedAt),
+                toSqlDate(code.createdAt),
+              ],
+            );
+          }
+
+          for (const membership of this.state.gatewayMemberships) {
+            await conn.query(
+              "INSERT INTO gateway_memberships (gateway_id, user_id, role, created_at) VALUES (?, ?, ?, ?)",
+              [
+                membership.gatewayId,
+                membership.userId,
+                membership.role,
+                toSqlDate(membership.createdAt),
+              ],
+            );
+          }
+
+          for (const runtime of Object.values(this.state.gatewayRuntimeState)) {
+            await conn.query(
+              "INSERT INTO gateway_runtime_state (gateway_id, relay_status, host_status, openclaw_status, aggregate_status, current_model, context_usage, context_limit, controller_user_id, controller_device_id, mobile_control_status, last_seen_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              [
+                runtime.gatewayId,
+                runtime.relayStatus,
+                runtime.hostStatus,
+                runtime.openclawStatus,
+                runtime.aggregateStatus,
+                runtime.currentModel ?? null,
+                runtime.contextUsage ?? null,
+                runtime.contextLimit ?? null,
+                runtime.controllerUserId ?? null,
+                runtime.controllerDeviceId ?? null,
+                runtime.mobileControlStatus,
+                toSqlDate(runtime.lastSeenAt),
+                toSqlDate(new Date().toISOString()),
+              ],
+            );
+          }
+
+          for (const log of this.state.commandAuditLogs.slice(0, 5000)) {
+            await conn.query(
+              "INSERT INTO command_audit_logs (gateway_id, user_id, method, risk_level, params_masked, result_ok, error_code, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              [
+                log.gatewayId,
+                log.userId,
+                log.method,
+                log.riskLevel,
+                log.paramsMasked,
+                log.resultOk ? 1 : 0,
+                log.errorCode ?? null,
+                log.durationMs,
+                toSqlDate(log.createdAt),
+              ],
+            );
+          }
+
+          for (const approval of this.state.approvals) {
+            await conn.query(
+              "INSERT INTO approvals (gateway_id, user_id, method, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+              [
+                approval.gatewayId,
+                approval.userId,
+                approval.method,
+                toSqlDate(approval.expiresAt),
+                toSqlDate(approval.createdAt),
+              ],
+            );
+          }
+
+          await conn.commit();
+          return;
+        } catch (error) {
+          shouldDestroyConnection = isClosedConnectionError(error);
+          try {
+            await conn.rollback();
+          } catch (rollbackError) {
+            if (!isClosedConnectionError(rollbackError)) {
+              console.error("[relay-store] rollback failed", rollbackError);
+            }
+          }
+          if (!shouldDestroyConnection || attempt >= maxAttempts) {
+            throw error;
+          }
+          console.warn(`[relay-store] retrying save after stale MySQL connection (attempt ${attempt}/${maxAttempts})`);
+        } finally {
+          if (shouldDestroyConnection) {
+            (conn as { destroy?: () => void }).destroy?.();
+          }
+          conn.release();
         }
-        throw error;
-      } finally {
-        conn.release();
       }
     });
     return this.saveQueue;

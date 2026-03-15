@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS gateway_runtime_state (
   aggregate_status VARCHAR(32) NOT NULL DEFAULT 'offline',
   current_model VARCHAR(128) DEFAULT NULL,
   context_usage INT DEFAULT NULL,
+  context_limit INT DEFAULT NULL,
   controller_user_id VARCHAR(64) DEFAULT NULL,
   controller_device_id VARCHAR(64) DEFAULT NULL,
   mobile_control_status VARCHAR(32) NOT NULL DEFAULT 'idle',
