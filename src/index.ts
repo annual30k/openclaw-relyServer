@@ -214,6 +214,96 @@ function ensureRateLimit(scope: string, key: string): boolean {
   return true;
 }
 
+function toPositiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+}
+
+function normalizeEventTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.round(value > 10_000_000_000 ? value : value * 1000);
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const trimmed = value.trim();
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return Math.round(numeric > 10_000_000_000 ? numeric : numeric * 1000);
+    }
+    const parsed = Date.parse(trimmed);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.round(parsed);
+    }
+  }
+  return undefined;
+}
+
+function normalizeRealtimeChatPayload(rawPayload: unknown, fallbackTimestamp = Date.now()): unknown {
+  if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+    return rawPayload;
+  }
+
+  const payload = { ...(rawPayload as Record<string, unknown>) };
+  const messageRecord =
+    payload.message && typeof payload.message === "object" && !Array.isArray(payload.message)
+      ? { ...(payload.message as Record<string, unknown>) }
+      : undefined;
+  const resolvedTimestamp =
+    normalizeEventTimestamp(payload.ts)
+    ?? normalizeEventTimestamp(payload.timestamp)
+    ?? normalizeEventTimestamp(payload.createdAt)
+    ?? normalizeEventTimestamp(payload.created_at)
+    ?? normalizeEventTimestamp(payload.time)
+    ?? normalizeEventTimestamp(messageRecord?.timestamp)
+    ?? fallbackTimestamp;
+
+  payload.ts = resolvedTimestamp;
+
+  if (messageRecord) {
+    messageRecord.timestamp = normalizeEventTimestamp(messageRecord.timestamp) ?? resolvedTimestamp;
+    if (
+      (!messageRecord.role || typeof messageRecord.role !== "string" || !messageRecord.role.trim())
+      && typeof payload.role === "string"
+      && payload.role.trim()
+    ) {
+      messageRecord.role = payload.role.trim();
+    }
+    payload.message = messageRecord;
+  }
+
+  return payload;
+}
+
+function extractContextMetrics(
+  payloadRecord: Record<string, unknown> | undefined,
+): Pick<GatewayRuntimeStateRecord, "contextUsage" | "contextLimit"> {
+  const usageRecord =
+    payloadRecord?.usage && typeof payloadRecord.usage === "object" && !Array.isArray(payloadRecord.usage)
+      ? (payloadRecord.usage as Record<string, unknown>)
+      : undefined;
+
+  const contextUsage =
+    toPositiveInteger(payloadRecord?.contextUsage) ??
+    toPositiveInteger(payloadRecord?.promptTokens) ??
+    toPositiveInteger(payloadRecord?.prompt_tokens) ??
+    toPositiveInteger(payloadRecord?.inputTokens) ??
+    toPositiveInteger(payloadRecord?.input_tokens) ??
+    toPositiveInteger(usageRecord?.promptTokens) ??
+    toPositiveInteger(usageRecord?.prompt_tokens) ??
+    toPositiveInteger(usageRecord?.inputTokens) ??
+    toPositiveInteger(usageRecord?.input_tokens);
+  const contextLimit =
+    toPositiveInteger(payloadRecord?.contextLimit) ??
+    toPositiveInteger(payloadRecord?.maxInputTokens) ??
+    toPositiveInteger(payloadRecord?.max_input_tokens) ??
+    toPositiveInteger(usageRecord?.contextLimit) ??
+    toPositiveInteger(usageRecord?.maxInputTokens) ??
+    toPositiveInteger(usageRecord?.max_input_tokens);
+
+  return {
+    contextUsage,
+    contextLimit,
+  };
+}
+
 function buildGatewaySummary(gateway: GatewayRecord) {
   const runtime = normalizeGatewayRuntime(gateway.id);
   return {
@@ -227,7 +317,8 @@ function buildGatewaySummary(gateway: GatewayRecord) {
     mobileControlStatus: runtime.mobileControlStatus,
     lastSeenAt: gateway.lastSeenAt ?? gateway.createdAt,
     currentModel: runtime.currentModel ?? "--",
-    contextUsage: "--",
+    contextUsage: runtime.contextUsage,
+    contextLimit: runtime.contextLimit,
   };
 }
 
@@ -780,11 +871,12 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
                 .join("\n\n")
                 .trim()
             : "";
-          if (!content) return [];
+          const normalizedContent = normalizeHistoryMessageContent(role, content);
+          if (!normalizedContent) return [];
           return [{
             id: `history-${index}`,
             role,
-            content,
+            content: normalizedContent,
             createdAt,
           }];
         })
@@ -802,6 +894,37 @@ function normalizeSessionTimestamp(value: unknown): string | undefined {
     return new Date(millis).toISOString();
   }
   return undefined;
+}
+
+function normalizeHistoryMessageContent(role: string, content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed || role !== "user") {
+    return trimmed;
+  }
+
+  // Command-mode user turns can be persisted as a synthetic prompt bundle:
+  // "System: [...] ...\n\n[time] actual user input". For mobile chat display,
+  // keep only the actual user-entered portion so it can reconcile with the
+  // optimistic local user bubble.
+  const looksLikeSyntheticPrompt =
+    /^System:\s*\[[^\]]+\]/.test(trimmed) && /\n\s*\n+\[[^\]]+\]\s*/.test(trimmed);
+  if (!looksLikeSyntheticPrompt) {
+    return trimmed;
+  }
+
+  const trailingBlock = trimmed
+    .split(/\n\s*\n+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .reverse()
+    .find((segment) => !segment.startsWith("System:"));
+
+  if (!trailingBlock) {
+    return trimmed;
+  }
+
+  const normalized = trailingBlock.replace(/^\[[^\]]+\]\s*/, "").trim();
+  return normalized || trimmed;
 }
 
 async function handleGatewayChatSessions(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string, requestUrl: URL): Promise<void> {
@@ -1265,9 +1388,13 @@ hostWsServer.on("connection", async (socket, req) => {
     }
 
     if (message.type === "event") {
+      const normalizedPayload =
+        message.event === "chat" || message.event === "agent"
+          ? normalizeRealtimeChatPayload(message.payload)
+          : message.payload;
       const payloadRecord =
-        message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
-          ? (message.payload as Record<string, unknown>)
+        normalizedPayload && typeof normalizedPayload === "object" && !Array.isArray(normalizedPayload)
+          ? (normalizedPayload as Record<string, unknown>)
           : undefined;
       const currentModel =
         typeof payloadRecord?.currentModel === "string"
@@ -1275,17 +1402,34 @@ hostWsServer.on("connection", async (socket, req) => {
           : typeof payloadRecord?.model === "string"
             ? payloadRecord.model
             : undefined;
-      touchGateway(gatewayIdValue, {
+      const { contextUsage, contextLimit } = extractContextMetrics(payloadRecord);
+      const runtimePatch: Partial<GatewayRuntimeStateRecord> = {
         lastSeenAt: nowIso(),
-        currentModel,
-      });
+      };
+      if (currentModel) {
+        runtimePatch.currentModel = currentModel;
+      }
+      if (contextUsage) {
+        runtimePatch.contextUsage = contextUsage;
+      }
+      if (contextLimit) {
+        runtimePatch.contextLimit = contextLimit;
+      }
+      touchGateway(gatewayIdValue, runtimePatch);
       schedulePersist();
       broadcastToGatewayMembers(gatewayIdValue, {
         type: "event",
         gatewayId: gatewayIdValue,
         event: message.event,
-        payload: message.payload,
+        payload: normalizedPayload,
       });
+      if (currentModel || contextUsage || contextLimit) {
+        broadcastToGatewayMembers(gatewayIdValue, {
+          type: "presence",
+          gatewayId: gatewayIdValue,
+          payload: buildGatewaySummary(gateway),
+        });
+      }
       return;
     }
 
@@ -1535,19 +1679,23 @@ mobileWsServer.on("connection", async (socket, req) => {
       const text = params && typeof params.message === "string" ? params.message.trim() : "";
       const sessionKeyValue = params && typeof params.sessionKey === "string" ? params.sessionKey : undefined;
       if (text) {
+        const eventTimestamp = Date.now();
         broadcastToGatewayMembers(gatewayIdValue, {
           type: "event",
           gatewayId: gatewayIdValue,
           event: "chat",
-          payload: {
+          payload: normalizeRealtimeChatPayload({
             state: "final",
             role: "user",
             sessionKey: sessionKeyValue,
             runId: requestId,
+            ts: eventTimestamp,
             message: {
+              role: "user",
+              timestamp: eventTimestamp,
               content: [{ type: "text", text }],
             },
-          },
+          }, eventTimestamp),
         }, socket);
       }
     }
