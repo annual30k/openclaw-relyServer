@@ -306,6 +306,10 @@ function extractContextMetrics(
 
 function buildGatewaySummary(gateway: GatewayRecord) {
   const runtime = normalizeGatewayRuntime(gateway.id);
+  const lastSeenAt =
+    normalizeSessionTimestamp(gateway.lastSeenAt)
+    ?? normalizeSessionTimestamp(gateway.createdAt)
+    ?? nowIso();
   return {
     gatewayId: gateway.id,
     displayName: gateway.displayName,
@@ -315,7 +319,7 @@ function buildGatewaySummary(gateway: GatewayRecord) {
     hostStatus: runtime.hostStatus,
     openclawStatus: runtime.openclawStatus,
     mobileControlStatus: runtime.mobileControlStatus,
-    lastSeenAt: gateway.lastSeenAt ?? gateway.createdAt,
+    lastSeenAt,
     currentModel: runtime.currentModel ?? "--",
     contextUsage: runtime.contextUsage,
     contextLimit: runtime.contextLimit,
@@ -789,6 +793,51 @@ async function handleGatewayDelete(req: IncomingMessage, res: ServerResponse, ga
   json(res, 200, { ok: true });
 }
 
+async function handleGatewayUpdate(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  const gateway = store.snapshot().gateways[gatewayIdValue];
+  if (!membership || !gateway) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
+  if (!displayName) {
+    json(res, 400, { error: "display_name_required" });
+    return;
+  }
+  if (displayName.length > 191) {
+    json(res, 400, { error: "display_name_too_long" });
+    return;
+  }
+
+  gateway.displayName = displayName;
+  gateway.updatedAt = nowIso();
+  store.putGateway(gateway);
+
+  await persist();
+
+  broadcastToGatewayMembers(gatewayIdValue, {
+    type: "presence",
+    gatewayId: gatewayIdValue,
+    payload: buildGatewaySummary(gateway),
+  });
+
+  json(res, 200, {
+    gateway: {
+      ...buildGatewaySummary(gateway),
+      role: membership.role,
+    },
+  });
+}
+
 async function handleGatewayModels(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
   const userId = requireAuthenticatedUser(req, res);
   if (!userId) return;
@@ -888,7 +937,18 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
 }
 
 function normalizeSessionTimestamp(value: unknown): string | undefined {
-  if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value.toISOString();
+  }
+  if (typeof value === "string") {
+    const trimmedValue = value.trim();
+    if (!trimmedValue) return undefined;
+    const parsed = Date.parse(trimmedValue);
+    if (!Number.isNaN(parsed)) {
+      return new Date(parsed).toISOString();
+    }
+    return trimmedValue;
+  }
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
     const millis = value > 10_000_000_000 ? value : value * 1000;
     return new Date(millis).toISOString();
@@ -1225,6 +1285,10 @@ const server = createServer((req, res) => {
       const detailMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)$/);
       if (detailMatch && req.method === "GET") {
         await handleGatewayDetail(req, res, detailMatch[1]);
+        return;
+      }
+      if (detailMatch && req.method === "PATCH") {
+        await handleGatewayUpdate(req, res, detailMatch[1]);
         return;
       }
       if (detailMatch && req.method === "DELETE") {
