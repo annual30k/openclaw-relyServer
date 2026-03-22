@@ -11,6 +11,7 @@ import type {
   GatewayRuntimeStateRecord,
   MobileDeviceRecord,
   RelayState,
+  TaskRecord,
   UserRecord,
 } from "./types.js";
 
@@ -23,6 +24,7 @@ const EMPTY_STATE: RelayState = {
   gatewayRuntimeState: {},
   commandAuditLogs: [],
   approvals: [],
+  tasks: {},
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -120,6 +122,22 @@ type ApprovalRow = RowDataPacket & {
   expires_at: string;
   created_at: string;
 };
+type TaskRow = RowDataPacket & {
+  id: string;
+  gateway_id: string;
+  user_id: string;
+  title: string;
+  prompt: string;
+  schedule_kind: TaskRecord["scheduleKind"];
+  schedule_at: string | null;
+  repeat_amount: number | null;
+  repeat_unit: TaskRecord["repeatUnit"] | null;
+  enabled: number;
+  last_result: string;
+  next_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
 
 export class RelayStore {
   private state: RelayState = structuredClone(EMPTY_STATE);
@@ -198,6 +216,9 @@ export class RelayStore {
     );
     const [approvals] = await this.pool.query<ApprovalRow[]>(
       "SELECT gateway_id, user_id, method, expires_at, created_at FROM approvals",
+    );
+    const [tasks] = await this.pool.query<TaskRow[]>(
+      "SELECT id, gateway_id, user_id, title, prompt, schedule_kind, schedule_at, repeat_amount, repeat_unit, enabled, last_result, next_run_at, created_at, updated_at FROM gateway_tasks",
     );
 
     this.state = structuredClone(EMPTY_STATE);
@@ -294,6 +315,25 @@ export class RelayStore {
       expiresAt: toIso(row.expires_at) ?? new Date().toISOString(),
       createdAt: toIso(row.created_at) ?? new Date().toISOString(),
     }));
+
+    for (const row of tasks) {
+      this.state.tasks[row.id] = {
+        id: row.id,
+        gatewayId: row.gateway_id,
+        userId: row.user_id,
+        title: row.title,
+        prompt: row.prompt,
+        scheduleKind: row.schedule_kind,
+        scheduleAt: toIso(row.schedule_at),
+        repeatAmount: row.repeat_amount ?? undefined,
+        repeatUnit: row.repeat_unit ?? undefined,
+        enabled: Boolean(row.enabled),
+        lastResult: row.last_result ?? "",
+        nextRunAt: toIso(row.next_run_at),
+        createdAt: toIso(row.created_at) ?? new Date().toISOString(),
+        updatedAt: toIso(row.updated_at) ?? new Date().toISOString(),
+      };
+    }
   }
 
   async save(): Promise<void> {
@@ -309,6 +349,7 @@ export class RelayStore {
           await conn.beginTransaction();
 
           await conn.query("DELETE FROM approvals");
+          await conn.query("DELETE FROM gateway_tasks");
           await conn.query("DELETE FROM command_audit_logs");
           await conn.query("DELETE FROM gateway_runtime_state");
           await conn.query("DELETE FROM gateway_memberships");
@@ -434,6 +475,28 @@ export class RelayStore {
             );
           }
 
+          for (const task of Object.values(this.state.tasks)) {
+            await conn.query(
+              "INSERT INTO gateway_tasks (id, gateway_id, user_id, title, prompt, schedule_kind, schedule_at, repeat_amount, repeat_unit, enabled, last_result, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              [
+                task.id,
+                task.gatewayId,
+                task.userId,
+                task.title,
+                task.prompt,
+                task.scheduleKind,
+                toSqlDate(task.scheduleAt),
+                task.repeatAmount ?? null,
+                task.repeatUnit ?? null,
+                task.enabled ? 1 : 0,
+                task.lastResult,
+                toSqlDate(task.nextRunAt),
+                toSqlDate(task.createdAt),
+                toSqlDate(task.updatedAt),
+              ],
+            );
+          }
+
           await conn.commit();
           return;
         } catch (error) {
@@ -516,6 +579,18 @@ export class RelayStore {
         ),
     );
     this.state.approvals.push(approval);
+  }
+
+  putTask(task: TaskRecord): void {
+    this.state.tasks[task.id] = task;
+  }
+
+  removeTask(taskId: string): void {
+    delete this.state.tasks[taskId];
+  }
+
+  tasksForGateway(gatewayId: string): TaskRecord[] {
+    return Object.values(this.state.tasks).filter((task) => task.gatewayId === gatewayId);
   }
 
   consumeApproval(gatewayId: string, userId: string, method: string, now: string): boolean {

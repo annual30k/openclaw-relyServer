@@ -10,6 +10,8 @@ export type HostStatus =
 export type MobileControlStatus = "idle" | "claimed" | "transfer_pending";
 export type Role = "owner" | "admin" | "viewer";
 export type RiskLevel = "L1" | "L2" | "L3";
+export type TaskScheduleKind = "once" | "repeat";
+export type TaskRepeatUnit = "minutes" | "hours" | "days" | "weeks";
 
 export interface UserRecord {
   id: string;
@@ -94,6 +96,23 @@ export interface ApprovalRecord {
   createdAt: string;
 }
 
+export interface TaskRecord {
+  id: string;
+  gatewayId: string;
+  userId: string;
+  title: string;
+  prompt: string;
+  scheduleKind: TaskScheduleKind;
+  scheduleAt?: string;
+  repeatAmount?: number;
+  repeatUnit?: TaskRepeatUnit;
+  enabled: boolean;
+  lastResult: string;
+  nextRunAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface RelayState {
   users: Record<string, UserRecord>;
   mobileDevices: Record<string, MobileDeviceRecord>;
@@ -103,6 +122,7 @@ export interface RelayState {
   gatewayRuntimeState: Record<string, GatewayRuntimeStateRecord>;
   commandAuditLogs: CommandAuditLogRecord[];
   approvals: ApprovalRecord[];
+  tasks: Record<string, TaskRecord>;
 }
 
 export interface RelayEnvelope {

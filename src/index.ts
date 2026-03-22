@@ -12,6 +12,9 @@ import type {
   MobileDeviceRecord,
   RelayEnvelope,
   Role,
+  TaskRecord,
+  TaskRepeatUnit,
+  TaskScheduleKind,
   UserRecord,
 } from "./types.js";
 
@@ -71,6 +74,15 @@ type PendingHostCommand = {
   timeout: NodeJS.Timeout;
 };
 
+type PendingTaskRun = {
+  taskId: string;
+  gatewayId: string;
+  userId: string;
+  sessionKey: string;
+  startedAt: number;
+  timeout: NodeJS.Timeout;
+};
+
 type TokenClaims = {
   userId: string;
   deviceId: string;
@@ -85,6 +97,9 @@ const mobileSessions = new Map<string, MobileSession>();
 const pendingResponses = new Map<string, PendingResponse>();
 const pendingHostCommands = new Map<string, PendingHostCommand>();
 const rateLimitBuckets = new Map<string, number[]>();
+const pendingTaskRunsBySessionKey = new Map<string, PendingTaskRun>();
+const pendingTaskRunsByTaskID = new Map<string, PendingTaskRun>();
+const taskRunTimeoutMs = 30 * 60 * 1000;
 
 const hostWsServer = new WebSocketServer({ noServer: true });
 const mobileWsServer = new WebSocketServer({ noServer: true });
@@ -429,6 +444,316 @@ async function dispatchHostCommand(
   });
 }
 
+function normalizeTaskScheduleKind(value: unknown): TaskScheduleKind | undefined {
+  if (value === "once" || value === "repeat") {
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeTaskRepeatUnit(value: unknown): TaskRepeatUnit | undefined {
+  if (value === "minutes" || value === "hours" || value === "days" || value === "weeks") {
+    return value;
+  }
+  return undefined;
+}
+
+function normalizeTaskRepeatAmount(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.max(1, Math.round(value));
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.max(1, Math.round(parsed));
+    }
+  }
+  return undefined;
+}
+
+function parseTaskDate(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const parsed = Date.parse(trimmed);
+  if (!Number.isFinite(parsed)) return undefined;
+  return new Date(parsed).toISOString();
+}
+
+function taskRepeatIntervalMs(amount: number, unit: TaskRepeatUnit): number {
+  const factors: Record<TaskRepeatUnit, number> = {
+    minutes: 60 * 1000,
+    hours: 60 * 60 * 1000,
+    days: 24 * 60 * 60 * 1000,
+    weeks: 7 * 24 * 60 * 60 * 1000,
+  };
+  return amount * factors[unit];
+}
+
+function computeNextTaskRun(task: TaskRecord, reference = new Date()): string | undefined {
+  const referenceMs = reference.getTime();
+  if (task.scheduleKind === "once") {
+    return task.scheduleAt;
+  }
+
+  const amount = task.repeatAmount ?? 1;
+  const unit = task.repeatUnit ?? "days";
+  const intervalMs = taskRepeatIntervalMs(amount, unit);
+  const baseValue = task.nextRunAt ?? task.scheduleAt;
+  const baseMs = baseValue ? Date.parse(baseValue) : referenceMs;
+  if (!Number.isFinite(baseMs) || intervalMs <= 0) {
+    return undefined;
+  }
+
+  let nextMs = baseMs;
+  while (nextMs <= referenceMs) {
+    nextMs += intervalMs;
+  }
+  return new Date(nextMs).toISOString();
+}
+
+function buildTaskTitle(prompt: string, fallback = "定时任务"): string {
+  const normalized = prompt.trim().replace(/\s+/g, " ");
+  if (!normalized) return fallback;
+  const sentence = normalized.split(/[。！？!?;；,，、\n]/).find((segment) => segment.trim().length > 0)?.trim() ?? normalized;
+  return sentence.slice(0, 40);
+}
+
+function formatTaskResultPreview(text: string, fallback: string): string {
+  const normalized = text.trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    return fallback;
+  }
+  return normalized.length > 160 ? `${normalized.slice(0, 160)}...` : normalized;
+}
+
+function normalizeTaskBody(
+  body: Record<string, unknown>,
+  existing?: TaskRecord,
+): {
+  title: string;
+  prompt: string;
+  scheduleKind: TaskScheduleKind;
+  scheduleAt?: string;
+  repeatAmount?: number;
+  repeatUnit?: TaskRepeatUnit;
+  enabled: boolean;
+  error?: string;
+} {
+  const scheduleKind = normalizeTaskScheduleKind(body.scheduleKind) ?? existing?.scheduleKind ?? "once";
+  const prompt = typeof body.prompt === "string" ? body.prompt.trim() : existing?.prompt ?? "";
+  const rawTitle = typeof body.title === "string" ? body.title.trim() : existing?.title ?? "";
+  const title = rawTitle || buildTaskTitle(prompt, existing?.title ?? "");
+  const scheduleAt = parseTaskDate(body.scheduleAt) ?? existing?.scheduleAt;
+  const repeatAmount =
+    scheduleKind === "repeat" ? normalizeTaskRepeatAmount(body.repeatAmount) ?? existing?.repeatAmount : undefined;
+  const repeatUnit =
+    scheduleKind === "repeat" ? normalizeTaskRepeatUnit(body.repeatUnit) ?? existing?.repeatUnit : undefined;
+  const enabled = typeof body.enabled === "boolean" ? body.enabled : existing?.enabled ?? true;
+
+  if (!prompt) {
+    return { title, prompt, scheduleKind, scheduleAt, repeatAmount, repeatUnit, enabled, error: "prompt_required" };
+  }
+  if (scheduleKind === "once" && !scheduleAt) {
+    return { title, prompt, scheduleKind, scheduleAt, repeatAmount, repeatUnit, enabled, error: "schedule_at_required" };
+  }
+  if (scheduleKind === "repeat") {
+    if (!scheduleAt) {
+      return { title, prompt, scheduleKind, scheduleAt, repeatAmount, repeatUnit, enabled, error: "schedule_at_required" };
+    }
+    if (!repeatAmount || repeatAmount <= 0) {
+      return { title, prompt, scheduleKind, scheduleAt, repeatAmount, repeatUnit, enabled, error: "repeat_amount_required" };
+    }
+    if (!repeatUnit) {
+      return { title, prompt, scheduleKind, scheduleAt, repeatAmount, repeatUnit, enabled, error: "repeat_unit_required" };
+    }
+  }
+
+  return {
+    title,
+    prompt,
+    scheduleKind,
+    scheduleAt,
+    repeatAmount,
+    repeatUnit,
+    enabled,
+  };
+}
+
+function listGatewayTasks(gatewayIdValue: string): TaskRecord[] {
+  return Object.values(store.snapshot().tasks)
+    .filter((task) => task.gatewayId === gatewayIdValue)
+    .sort((left, right) => {
+      if (left.enabled !== right.enabled) {
+        return left.enabled ? -1 : 1;
+      }
+      const leftNext = left.nextRunAt ? Date.parse(left.nextRunAt) : Number.POSITIVE_INFINITY;
+      const rightNext = right.nextRunAt ? Date.parse(right.nextRunAt) : Number.POSITIVE_INFINITY;
+      if (leftNext !== rightNext) {
+        return leftNext - rightNext;
+      }
+      return left.createdAt.localeCompare(right.createdAt);
+    });
+}
+
+function broadcastTaskUpdate(gatewayIdValue: string, taskId: string, event = "task_updated"): void {
+  broadcastToGatewayMembers(gatewayIdValue, {
+    type: "event",
+    gatewayId: gatewayIdValue,
+    event,
+    payload: { taskId, gatewayId: gatewayIdValue },
+  });
+}
+
+function extractTaskResultText(payload: unknown): string {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "";
+  const record = payload as Record<string, unknown>;
+  const message = record.message;
+  if (message && typeof message === "object" && !Array.isArray(message)) {
+    const messageRecord = message as Record<string, unknown>;
+    if (Array.isArray(messageRecord.content)) {
+      const text = messageRecord.content
+        .filter((block): block is Record<string, unknown> => Boolean(block) && typeof block === "object" && !Array.isArray(block))
+        .filter((block) => block.type === "text" && typeof block.text === "string")
+        .map((block) => String(block.text))
+        .join("\n\n")
+        .trim();
+      if (text) return text;
+    }
+  }
+  for (const candidate of [record.text, record.result, record.output, record.content]) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return "";
+}
+
+function updateTaskFromChatEvent(gatewayIdValue: string, eventName: string | undefined, payload: unknown): void {
+  if (eventName !== "chat" && eventName !== "agent") return;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+  const record = payload as Record<string, unknown>;
+  const sessionKey = typeof record.sessionKey === "string" ? record.sessionKey : "";
+  const role = typeof record.role === "string" ? record.role.trim().toLowerCase() : "";
+  if (role === "user") return;
+  const taskMatch = sessionKey.match(/^task:([^:]+):/);
+  if (!taskMatch?.[1]) return;
+  const taskId = taskMatch[1];
+  const task = store.snapshot().tasks[taskId];
+  if (!task || task.gatewayId !== gatewayIdValue) return;
+
+  const state = typeof record.state === "string"
+    ? record.state
+    : typeof record.phase === "string"
+      ? record.phase
+      : typeof record.data === "object" && record.data && !Array.isArray(record.data)
+        ? String((record.data as Record<string, unknown>).phase ?? "")
+        : "";
+  const normalizedState = state.trim().toLowerCase();
+  if (normalizedState && !["final", "done", "completed", "complete", "end", "failed", "error", "fail", "aborted"].includes(normalizedState)) {
+    return;
+  }
+
+  const resultText = extractTaskResultText(payload);
+  if (normalizedState === "failed" || normalizedState === "error" || normalizedState === "fail") {
+    task.lastResult = resultText ? `执行失败：${formatTaskResultPreview(resultText, "执行失败")}` : "执行失败";
+  } else if (normalizedState === "aborted") {
+    task.lastResult = resultText ? `已中止：${formatTaskResultPreview(resultText, "已中止")}` : "已中止";
+  } else {
+    task.lastResult = formatTaskResultPreview(resultText, task.lastResult || "执行完成");
+  }
+  task.updatedAt = nowIso();
+  store.putTask(task);
+  const pending = pendingTaskRunsBySessionKey.get(sessionKey);
+  if (pending) {
+    clearTimeout(pending.timeout);
+    pendingTaskRunsBySessionKey.delete(sessionKey);
+    pendingTaskRunsByTaskID.delete(pending.taskId);
+  }
+  broadcastTaskUpdate(gatewayIdValue, task.id, "task_updated");
+  schedulePersist();
+}
+
+async function runDueTasksOnce(): Promise<void> {
+  const now = new Date();
+  const dueTasks = Object.values(store.snapshot().tasks)
+    .filter((task) => task.enabled)
+    .filter((task) => {
+      if (!task.nextRunAt) return false;
+      const dueAt = Date.parse(task.nextRunAt);
+      return Number.isFinite(dueAt) && dueAt <= now.getTime();
+    })
+    .sort((left, right) => Date.parse(left.nextRunAt ?? left.createdAt) - Date.parse(right.nextRunAt ?? right.createdAt));
+
+  for (const task of dueTasks) {
+    if (pendingTaskRunsByTaskID.has(task.id)) {
+      continue;
+    }
+
+    const runSessionKey = `task:${task.id}:${randomUUID()}`;
+    const timeout = setTimeout(() => {
+      pendingTaskRunsBySessionKey.delete(runSessionKey);
+      pendingTaskRunsByTaskID.delete(task.id);
+    }, taskRunTimeoutMs);
+    timeout.unref?.();
+    const pendingRun: PendingTaskRun = {
+      taskId: task.id,
+      gatewayId: task.gatewayId,
+      userId: task.userId,
+      sessionKey: runSessionKey,
+      startedAt: Date.now(),
+      timeout,
+    };
+    pendingTaskRunsByTaskID.set(task.id, pendingRun);
+    pendingTaskRunsBySessionKey.set(runSessionKey, pendingRun);
+
+    task.lastResult = "正在执行...";
+    if (task.scheduleKind === "once") {
+      task.enabled = false;
+      task.nextRunAt = undefined;
+    } else {
+      task.nextRunAt = computeNextTaskRun(task, now);
+    }
+    task.updatedAt = nowIso();
+    store.putTask(task);
+    broadcastTaskUpdate(task.gatewayId, task.id);
+    schedulePersist();
+
+    try {
+      await dispatchHostCommand(task.gatewayId, task.userId, "chat.send", {
+        sessionKey: runSessionKey,
+        message: task.prompt,
+        idempotencyKey: runSessionKey,
+        runId: runSessionKey,
+      });
+      task.lastResult = "已触发，等待主机返回";
+      task.updatedAt = nowIso();
+      store.putTask(task);
+      broadcastTaskUpdate(task.gatewayId, task.id);
+      schedulePersist();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      task.lastResult = `执行失败：${message}`;
+      const pending = pendingTaskRunsByTaskID.get(task.id);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        pendingTaskRunsByTaskID.delete(task.id);
+        pendingTaskRunsBySessionKey.delete(pending.sessionKey);
+      }
+      if (task.scheduleKind === "once") {
+        task.enabled = false;
+        task.nextRunAt = undefined;
+      } else {
+        task.nextRunAt = computeNextTaskRun(task, new Date());
+      }
+      task.updatedAt = nowIso();
+      store.putTask(task);
+      broadcastTaskUpdate(task.gatewayId, task.id);
+      schedulePersist();
+    }
+  }
+}
+
 type HostSkillStatusEntry = {
   skillKey?: string;
   blockedByAllowlist?: boolean;
@@ -507,6 +832,35 @@ function schedulePersist(delayMs = 250): void {
       });
   }, delayMs);
   scheduledPersistTimer.unref?.();
+}
+
+let scheduledTaskSweepTimer: NodeJS.Timeout | undefined;
+let scheduledTaskSweepTask: Promise<void> | undefined;
+let taskSweepRequestedWhileRunning = false;
+
+function scheduleTaskSweep(delayMs = 1000): void {
+  if (scheduledTaskSweepTask) {
+    taskSweepRequestedWhileRunning = true;
+    return;
+  }
+  if (scheduledTaskSweepTimer) return;
+  scheduledTaskSweepTimer = setTimeout(() => {
+    scheduledTaskSweepTimer = undefined;
+    scheduledTaskSweepTask = runDueTasksOnce()
+      .catch((error) => {
+        console.error("[relay] task sweep failed", error);
+      })
+      .finally(() => {
+        scheduledTaskSweepTask = undefined;
+        if (taskSweepRequestedWhileRunning) {
+          taskSweepRequestedWhileRunning = false;
+          scheduleTaskSweep();
+          return;
+        }
+        scheduleTaskSweep(15_000);
+      });
+  }, delayMs);
+  scheduledTaskSweepTimer.unref?.();
 }
 
 function issueAccessCode(): string {
@@ -946,6 +1300,162 @@ async function handleGatewaySkills(req: IncomingMessage, res: ServerResponse, ga
     const response = hostCommandErrorResponse(error);
     json(res, response.status, response.body);
   }
+}
+
+async function handleGatewayTasks(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+
+  if (req.method === "GET") {
+    json(res, 200, { items: listGatewayTasks(gatewayIdValue) });
+    return;
+  }
+
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+
+  if (req.method === "POST") {
+    const normalized = normalizeTaskBody(body);
+    if (normalized.error) {
+      json(res, 400, { error: normalized.error });
+      return;
+    }
+
+    const taskId = `task_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const now = nowIso();
+    const task: TaskRecord = {
+      id: taskId,
+      gatewayId: gatewayIdValue,
+      userId,
+      title: normalized.title,
+      prompt: normalized.prompt,
+      scheduleKind: normalized.scheduleKind,
+      scheduleAt: normalized.scheduleAt,
+      repeatAmount: normalized.repeatAmount,
+      repeatUnit: normalized.repeatUnit,
+      enabled: normalized.enabled,
+      lastResult: "",
+      nextRunAt: normalized.scheduleKind === "repeat" ? computeNextTaskRun({
+        id: taskId,
+        gatewayId: gatewayIdValue,
+        userId,
+        title: normalized.title,
+        prompt: normalized.prompt,
+        scheduleKind: normalized.scheduleKind,
+        scheduleAt: normalized.scheduleAt,
+        repeatAmount: normalized.repeatAmount,
+        repeatUnit: normalized.repeatUnit,
+        enabled: normalized.enabled,
+        lastResult: "",
+        nextRunAt: undefined,
+        createdAt: now,
+        updatedAt: now,
+      }, new Date(now)) : normalized.scheduleAt,
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (!task.nextRunAt && task.scheduleKind === "once") {
+      task.nextRunAt = task.scheduleAt;
+    }
+    store.putTask(task);
+    await persist();
+    broadcastTaskUpdate(gatewayIdValue, task.id);
+    scheduleTaskSweep(0);
+    json(res, 200, { task });
+    return;
+  }
+
+  json(res, 405, { error: "method_not_allowed" });
+}
+
+async function handleGatewayTask(
+  req: IncomingMessage,
+  res: ServerResponse,
+  gatewayIdValue: string,
+  taskIdValue: string,
+): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+
+  const task = store.snapshot().tasks[taskIdValue];
+  if (!task || task.gatewayId !== gatewayIdValue) {
+    json(res, 404, { error: "task_not_found" });
+    return;
+  }
+
+  if (req.method === "DELETE") {
+    if (membership.role === "viewer") {
+      json(res, 403, { error: "forbidden" });
+      return;
+    }
+    const pending = pendingTaskRunsByTaskID.get(taskIdValue);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      pendingTaskRunsByTaskID.delete(taskIdValue);
+    }
+    store.removeTask(taskIdValue);
+    await persist();
+    broadcastTaskUpdate(gatewayIdValue, taskIdValue);
+    scheduleTaskSweep(0);
+    json(res, 200, { ok: true });
+    return;
+  }
+
+  if (req.method !== "PATCH") {
+    json(res, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const normalized = normalizeTaskBody(body, task);
+  if (normalized.error) {
+    json(res, 400, { error: normalized.error });
+    return;
+  }
+
+  task.title = normalized.title;
+  task.prompt = normalized.prompt;
+  task.scheduleKind = normalized.scheduleKind;
+  task.scheduleAt = normalized.scheduleAt;
+  task.repeatAmount = normalized.repeatAmount;
+  task.repeatUnit = normalized.repeatUnit;
+  task.enabled = normalized.enabled;
+
+  const scheduleFieldsChanged =
+    body.title !== undefined ||
+    body.prompt !== undefined ||
+    body.scheduleKind !== undefined ||
+    body.scheduleAt !== undefined ||
+    body.repeatAmount !== undefined ||
+    body.repeatUnit !== undefined;
+  if (scheduleFieldsChanged || task.enabled) {
+    task.nextRunAt = computeNextTaskRun(task, new Date());
+  }
+  task.updatedAt = nowIso();
+  store.putTask(task);
+  await persist();
+  broadcastTaskUpdate(gatewayIdValue, task.id);
+  scheduleTaskSweep(0);
+  json(res, 200, { task });
 }
 
 async function handleGatewaySkillUpdate(
@@ -1465,6 +1975,23 @@ const server = createServer((req, res) => {
         return;
       }
 
+      const tasksMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/tasks$/);
+      if (tasksMatch && (req.method === "GET" || req.method === "POST")) {
+        await handleGatewayTasks(req, res, decodePathSegment(tasksMatch[1]));
+        return;
+      }
+
+      const taskDetailMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/tasks\/([^/]+)$/);
+      if (taskDetailMatch && (req.method === "PATCH" || req.method === "DELETE")) {
+        await handleGatewayTask(
+          req,
+          res,
+          decodePathSegment(taskDetailMatch[1]),
+          decodePathSegment(taskDetailMatch[2]),
+        );
+        return;
+      }
+
       const skillUpdateMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/skills\/([^/]+)$/);
       if (skillUpdateMatch && req.method === "PATCH") {
         await handleGatewaySkillUpdate(req, res, decodePathSegment(skillUpdateMatch[1]), decodePathSegment(skillUpdateMatch[2]));
@@ -1600,6 +2127,7 @@ hostWsServer.on("connection", async (socket, req) => {
       });
       schedulePersist();
       broadcastToGatewayMembers(gatewayIdValue, { type: "presence", gatewayId: gatewayIdValue, payload: buildGatewaySummary(gateway) });
+      scheduleTaskSweep(0);
       return;
     }
 
@@ -1650,6 +2178,7 @@ hostWsServer.on("connection", async (socket, req) => {
       }
       touchGateway(gatewayIdValue, runtimePatch);
       schedulePersist();
+      updateTaskFromChatEvent(gatewayIdValue, message.event, normalizedPayload);
       broadcastToGatewayMembers(gatewayIdValue, {
         type: "event",
         gatewayId: gatewayIdValue,
@@ -1742,6 +2271,18 @@ hostWsServer.on("connection", async (socket, req) => {
   socket.on("close", async () => {
     hostSessions.delete(gatewayIdValue);
     metrics.hostConnections = hostSessions.size;
+    for (const [sessionKey, pending] of pendingTaskRunsBySessionKey.entries()) {
+      if (pending.gatewayId !== gatewayIdValue) continue;
+      clearTimeout(pending.timeout);
+      pendingTaskRunsBySessionKey.delete(sessionKey);
+      pendingTaskRunsByTaskID.delete(pending.taskId);
+      const task = store.snapshot().tasks[pending.taskId];
+      if (!task || task.gatewayId !== gatewayIdValue) continue;
+      task.lastResult = "执行失败：网关断开连接";
+      task.updatedAt = nowIso();
+      store.putTask(task);
+      broadcastTaskUpdate(gatewayIdValue, task.id);
+    }
     touchGateway(gatewayIdValue, {
       relayStatus: "offline",
       hostStatus: "offline",

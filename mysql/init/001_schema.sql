@@ -130,6 +130,34 @@ CREATE TABLE IF NOT EXISTS gateway_runtime_state (
     ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS gateway_tasks (
+  id VARCHAR(64) NOT NULL,
+  gateway_id VARCHAR(64) NOT NULL,
+  user_id VARCHAR(64) NOT NULL,
+  title VARCHAR(191) NOT NULL,
+  prompt LONGTEXT NOT NULL,
+  schedule_kind VARCHAR(16) NOT NULL,
+  schedule_at DATETIME DEFAULT NULL,
+  repeat_amount INT DEFAULT NULL,
+  repeat_unit VARCHAR(16) DEFAULT NULL,
+  enabled TINYINT(1) NOT NULL DEFAULT 1,
+  last_result LONGTEXT NOT NULL,
+  next_run_at DATETIME DEFAULT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_gateway_tasks_gateway_id (gateway_id),
+  KEY idx_gateway_tasks_user_id (user_id),
+  KEY idx_gateway_tasks_next_run_at (next_run_at),
+  KEY idx_gateway_tasks_enabled_next_run_at (enabled, next_run_at),
+  CONSTRAINT fk_gateway_tasks_gateway
+    FOREIGN KEY (gateway_id) REFERENCES gateways (id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_gateway_tasks_user
+    FOREIGN KEY (user_id) REFERENCES users (id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS command_audit_logs (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   gateway_id VARCHAR(64) NOT NULL,
