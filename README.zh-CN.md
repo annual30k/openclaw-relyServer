@@ -9,6 +9,7 @@
 - 移动端配对
 - 主机端与移动端 WebSocket 接入
 - 命令转发、事件回传、在线态聚合
+- 技能状态查询与写回主机端
 - 高危命令审批
 - 审计日志
 - MySQL 5.7 持久化
@@ -112,6 +113,8 @@ curl http://127.0.0.1:8080/healthz
 - `GET /api/mobile/gateways`
 - `GET /api/mobile/gateways/:gatewayId`
 - `DELETE /api/mobile/gateways/:gatewayId`
+- `GET /api/mobile/gateways/:gatewayId/skills`
+- `PATCH /api/mobile/gateways/:gatewayId/skills/:skillKey`
 - `POST /api/mobile/gateways/:gatewayId/approve-sensitive-action`
 - `GET /healthz`
 - `GET /metrics`

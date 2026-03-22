@@ -8,17 +8,23 @@ const HIGH_RISK_METHODS = new Set([
   "provider.delete",
 ]);
 
-const READ_ONLY_PREFIXES = [
+const READ_ONLY_METHODS = new Set([
   "chat.history",
   "chat.list",
   "logs.get",
   "logs.list",
+  "pocketclaw.model.list",
+  "skills.status",
+]);
+
+const READ_ONLY_PREFIXES = [
   "status.",
   "relay.",
 ];
 
 export function classifyRisk(method: string): RiskLevel {
   if (HIGH_RISK_METHODS.has(method)) return "L3";
+  if (READ_ONLY_METHODS.has(method)) return "L1";
   if (READ_ONLY_PREFIXES.some((prefix) => method.startsWith(prefix))) return "L1";
   return "L2";
 }

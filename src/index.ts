@@ -429,6 +429,54 @@ async function dispatchHostCommand(
   });
 }
 
+type HostSkillStatusEntry = {
+  skillKey?: string;
+  blockedByAllowlist?: boolean;
+};
+
+type HostSkillsStatusReport = {
+  skills?: HostSkillStatusEntry[];
+};
+
+function decodePathSegment(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function parseStringRecord(value: unknown): Record<string, string> | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+
+  const record: Record<string, string> = {};
+  for (const [key, rawValue] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof rawValue !== "string") {
+      return undefined;
+    }
+    record[key] = rawValue;
+  }
+  return record;
+}
+
+function hostCommandErrorResponse(error: unknown): { status: number; body: { error: string } } {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = message.split(":")[0]?.trim() || "host_error";
+  switch (code) {
+  case "gateway_offline":
+    return { status: 503, body: { error: code } };
+  case "timeout":
+    return { status: 504, body: { error: code } };
+  case "skill_not_found":
+    return { status: 404, body: { error: code } };
+  case "skill_blocked":
+    return { status: 403, body: { error: code } };
+  default:
+    return { status: 502, body: { error: code } };
+  }
+}
+
 async function persist(): Promise<void> {
   store.cleanupExpired(nowIso());
   await store.save();
@@ -875,6 +923,115 @@ async function handleGatewayModels(req: IncomingMessage, res: ServerResponse, ga
   }
 }
 
+async function handleGatewaySkills(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "skills.status", {});
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    schedulePersist();
+    json(res, 200, payload ?? { skills: [] });
+  } catch (error) {
+    const response = hostCommandErrorResponse(error);
+    json(res, response.status, response.body);
+  }
+}
+
+async function handleGatewaySkillUpdate(
+  req: IncomingMessage,
+  res: ServerResponse,
+  gatewayIdValue: string,
+  skillKeyValue: string,
+): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  const skillKeyRaw = skillKeyValue.trim();
+  if (!skillKeyRaw) {
+    json(res, 400, { error: "skill_key_required" });
+    return;
+  }
+
+  const enabledProvided = typeof body.enabled === "boolean";
+  if (body.enabled !== undefined && !enabledProvided) {
+    json(res, 400, { error: "enabled_invalid" });
+    return;
+  }
+
+  const apiKeyProvided = body.apiKey !== undefined;
+  if (apiKeyProvided && typeof body.apiKey !== "string") {
+    json(res, 400, { error: "api_key_invalid" });
+    return;
+  }
+
+  const envProvided = body.env !== undefined;
+  const env = parseStringRecord(body.env);
+  if (envProvided && (body.env === null || env === undefined)) {
+    json(res, 400, { error: "env_invalid" });
+    return;
+  }
+
+  const hasEnvEntries = env !== undefined && Object.keys(env).length > 0;
+
+  if (!enabledProvided && !apiKeyProvided && !hasEnvEntries) {
+    json(res, 400, { error: "update_payload_required" });
+    return;
+  }
+
+  try {
+    const report = await dispatchHostCommand(gatewayIdValue, userId, "skills.status", {});
+    const statusReport = report as HostSkillsStatusReport | null | undefined;
+    const currentSkill = statusReport?.skills?.find((skill) => skill && skill.skillKey === skillKeyRaw);
+    if (!currentSkill) {
+      json(res, 404, { error: "skill_not_found" });
+      return;
+    }
+    if (body.enabled === true && currentSkill.blockedByAllowlist) {
+      json(res, 403, { error: "skill_blocked" });
+      return;
+    }
+
+    const updateParams: Record<string, unknown> = { skillKey: skillKeyRaw };
+    if (enabledProvided) updateParams.enabled = body.enabled;
+    if (apiKeyProvided) updateParams.apiKey = body.apiKey;
+    if (envProvided && env !== undefined) updateParams.env = env;
+
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "skills.update", updateParams);
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    schedulePersist();
+    json(res, 200, payload ?? { ok: true });
+  } catch (error) {
+    const response = hostCommandErrorResponse(error);
+    json(res, response.status, response.body);
+  }
+}
+
 async function handleGatewayChatHistory(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string, requestUrl: URL): Promise<void> {
   const userId = requireAuthenticatedUser(req, res);
   if (!userId) return;
@@ -1299,6 +1456,18 @@ const server = createServer((req, res) => {
       const modelsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models$/);
       if (modelsMatch && req.method === "GET") {
         await handleGatewayModels(req, res, modelsMatch[1]);
+        return;
+      }
+
+      const skillsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/skills$/);
+      if (skillsMatch && req.method === "GET") {
+        await handleGatewaySkills(req, res, skillsMatch[1]);
+        return;
+      }
+
+      const skillUpdateMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/skills\/([^/]+)$/);
+      if (skillUpdateMatch && req.method === "PATCH") {
+        await handleGatewaySkillUpdate(req, res, decodePathSegment(skillUpdateMatch[1]), decodePathSegment(skillUpdateMatch[2]));
         return;
       }
 

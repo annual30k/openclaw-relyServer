@@ -8,6 +8,7 @@ MVP relay server that implements the development contract in `docs/relay-develop
 - Mobile pairing and gateway membership
 - Host and mobile WebSocket entrypoints
 - Command routing, event fan-out, and response relay
+- Skills status lookup and write-back to the host gateway
 - Presence aggregation, sensitive-action approval, and audit logging
 - File-backed persistence for local development
 - Docker and Docker Compose support
@@ -54,6 +55,8 @@ Current status: the application persistence layer uses MySQL 5.7 through `DATABA
 - `GET /api/mobile/gateways`
 - `GET /api/mobile/gateways/:gatewayId`
 - `DELETE /api/mobile/gateways/:gatewayId`
+- `GET /api/mobile/gateways/:gatewayId/skills`
+- `PATCH /api/mobile/gateways/:gatewayId/skills/:skillKey`
 - `POST /api/mobile/gateways/:gatewayId/approve-sensitive-action`
 - `GET /healthz`
 - `GET /metrics`
