@@ -444,6 +444,268 @@ async function dispatchHostCommand(
   });
 }
 
+function readTaskString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function readTaskBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function readTaskNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function msToIsoTimestamp(value: unknown): string | undefined {
+  const ms = readTaskNumber(value);
+  if (ms === undefined) {
+    return undefined;
+  }
+  return new Date(ms).toISOString();
+}
+
+function deriveRepeatConfigFromEveryMs(
+  everyMs: number,
+): Pick<TaskRecord, "repeatAmount" | "repeatUnit"> {
+  const units: Array<[TaskRepeatUnit, number]> = [
+    ["weeks", 7 * 24 * 60 * 60 * 1000],
+    ["days", 24 * 60 * 60 * 1000],
+    ["hours", 60 * 60 * 1000],
+    ["minutes", 60 * 1000],
+  ];
+
+  for (const [unit, factor] of units) {
+    if (everyMs > 0 && everyMs % factor === 0) {
+      return {
+        repeatAmount: everyMs / factor,
+        repeatUnit: unit,
+      };
+    }
+  }
+
+  return {};
+}
+
+function buildTaskLastResultFromCronState(state: Record<string, unknown> | undefined): string {
+  if (!state) {
+    return "";
+  }
+
+  const lastRunStatus = readTaskString(state.lastRunStatus) ?? readTaskString(state.lastStatus) ?? "";
+  const lastDeliveryStatus = readTaskString(state.lastDeliveryStatus) ?? "";
+  const lastError = readTaskString(state.lastError) ?? "";
+  const lastDeliveryError = readTaskString(state.lastDeliveryError) ?? "";
+  const lastDelivered = readTaskBoolean(state.lastDelivered);
+
+  if (lastRunStatus === "ok") {
+    if (lastDeliveryStatus === "delivered" || lastDelivered === true) {
+      return "执行成功，已投递";
+    }
+    if (lastDeliveryStatus === "not-delivered" || lastDelivered === false) {
+      return "执行成功，未投递";
+    }
+    return "执行成功";
+  }
+  if (lastRunStatus === "skipped") {
+    return "已跳过";
+  }
+  if (lastRunStatus === "error" || lastRunStatus === "fail" || lastRunStatus === "failed") {
+    return lastError ? `执行失败：${formatTaskResultPreview(lastError, "执行失败")}` : "执行失败";
+  }
+  if (lastDeliveryStatus === "delivered") {
+    return "执行成功，已投递";
+  }
+  if (lastDeliveryStatus === "not-delivered") {
+    return "执行成功，未投递";
+  }
+  if (lastDeliveryError) {
+    return `投递失败：${formatTaskResultPreview(lastDeliveryError, "投递失败")}`;
+  }
+  if (lastError) {
+    return `执行失败：${formatTaskResultPreview(lastError, "执行失败")}`;
+  }
+  return "";
+}
+
+function mapCronJobToTaskRecord(
+  gatewayIdValue: string,
+  userId: string,
+  job: Record<string, unknown>,
+): TaskRecord | null {
+  const id = readTaskString(job.id);
+  if (!id) {
+    return null;
+  }
+
+  const schedule = job.schedule && typeof job.schedule === "object" && !Array.isArray(job.schedule)
+    ? (job.schedule as Record<string, unknown>)
+    : undefined;
+  const payload = job.payload && typeof job.payload === "object" && !Array.isArray(job.payload)
+    ? (job.payload as Record<string, unknown>)
+    : undefined;
+  const state = job.state && typeof job.state === "object" && !Array.isArray(job.state)
+    ? (job.state as Record<string, unknown>)
+    : undefined;
+
+  const prompt =
+    readTaskString(payload?.message) ??
+    readTaskString(payload?.text) ??
+    readTaskString(job.description) ??
+    "";
+  const titleSource = prompt || readTaskString(job.description) || "";
+  const title = readTaskString(job.name) ?? buildTaskTitle(titleSource, "定时任务");
+  const enabled = readTaskBoolean(job.enabled) ?? true;
+  const createdAtMs = readTaskNumber(job.createdAtMs);
+  const updatedAtMs = readTaskNumber(job.updatedAtMs) ?? createdAtMs;
+  const createdAt = createdAtMs !== undefined ? new Date(createdAtMs).toISOString() : nowIso();
+  const updatedAt = updatedAtMs !== undefined ? new Date(updatedAtMs).toISOString() : createdAt;
+  const nextRunAt = msToIsoTimestamp(state?.nextRunAtMs);
+  const scheduleKindRaw = readTaskString(schedule?.kind)?.toLowerCase() ?? "";
+
+  let scheduleKind: TaskScheduleKind = nextRunAt ? "repeat" : "once";
+  let scheduleAt: string | undefined = nextRunAt ?? createdAt;
+  let repeatAmount: number | undefined;
+  let repeatUnit: TaskRepeatUnit | undefined;
+
+  if (scheduleKindRaw === "at") {
+    scheduleKind = "once";
+    scheduleAt =
+      msToIsoTimestamp(schedule?.atMs) ??
+      readTaskString(schedule?.at) ??
+      nextRunAt ??
+      createdAt;
+  } else if (scheduleKindRaw === "every") {
+    scheduleKind = "repeat";
+    const everyMs = readTaskNumber(schedule?.everyMs);
+    if (everyMs !== undefined) {
+      const repeat = deriveRepeatConfigFromEveryMs(everyMs);
+      repeatAmount = repeat.repeatAmount;
+      repeatUnit = repeat.repeatUnit;
+    }
+    scheduleAt =
+      msToIsoTimestamp(schedule?.anchorMs) ??
+      nextRunAt ??
+      createdAt;
+  } else if (scheduleKindRaw === "cron") {
+    scheduleKind = "repeat";
+    scheduleAt = nextRunAt ?? createdAt;
+  }
+
+  return {
+    id,
+    gatewayId: gatewayIdValue,
+    userId,
+    title,
+    prompt,
+    scheduleKind,
+    scheduleAt,
+    repeatAmount,
+    repeatUnit,
+    enabled,
+    lastResult: buildTaskLastResultFromCronState(state),
+    nextRunAt,
+    createdAt,
+    updatedAt,
+  };
+}
+
+function sortTaskRecords(tasks: TaskRecord[]): TaskRecord[] {
+  return [...tasks].sort((left: TaskRecord, right: TaskRecord) => {
+    if (left.enabled !== right.enabled) {
+      return left.enabled ? -1 : 1;
+    }
+    const leftNext = left.nextRunAt ? Date.parse(left.nextRunAt) : Number.POSITIVE_INFINITY;
+    const rightNext = right.nextRunAt ? Date.parse(right.nextRunAt) : Number.POSITIVE_INFINITY;
+    if (leftNext !== rightNext) {
+      return leftNext - rightNext;
+    }
+    return left.createdAt.localeCompare(right.createdAt);
+  });
+}
+
+function buildTaskRecordFromCronResponse(
+  gatewayIdValue: string,
+  userId: string,
+  payload: unknown,
+): TaskRecord | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  return mapCronJobToTaskRecord(gatewayIdValue, userId, payload as Record<string, unknown>);
+}
+
+async function fetchGatewayCronTasks(gatewayIdValue: string, userId: string): Promise<TaskRecord[]> {
+  const items: TaskRecord[] = [];
+  const seen = new Set<string>();
+  const pageLimit = 200;
+  let offset = 0;
+
+  while (true) {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "cron.list", {
+      includeDisabled: true,
+      limit: pageLimit,
+      offset,
+      sortBy: "nextRunAtMs",
+      sortDir: "asc",
+    });
+    const page =
+      payload && typeof payload === "object" && !Array.isArray(payload)
+        ? (payload as { jobs?: unknown[]; hasMore?: unknown; nextOffset?: unknown })
+        : {};
+    const jobs = Array.isArray(page.jobs) ? page.jobs : [];
+    for (const job of jobs) {
+      const task = buildTaskRecordFromCronResponse(gatewayIdValue, userId, job);
+      if (!task || seen.has(task.id)) {
+        continue;
+      }
+      seen.add(task.id);
+      items.push(task);
+    }
+
+    const hasMore = page.hasMore === true;
+    const nextOffset =
+      typeof page.nextOffset === "number" && Number.isFinite(page.nextOffset)
+        ? Math.max(0, Math.floor(page.nextOffset))
+        : undefined;
+    if (!hasMore || nextOffset === undefined || nextOffset <= offset) {
+      break;
+    }
+    offset = nextOffset;
+  }
+
+  return items;
+}
+
+async function listGatewayTasksForMobile(gatewayIdValue: string, userId: string): Promise<TaskRecord[]> {
+  const [legacyTasks, cronTasks] = await Promise.all([
+    Promise.resolve(listGatewayTasks(gatewayIdValue)),
+    fetchGatewayCronTasks(gatewayIdValue, userId),
+  ]);
+
+  const merged = new Map<string, TaskRecord>();
+  for (const task of legacyTasks) {
+    merged.set(task.id, task);
+  }
+  for (const task of cronTasks) {
+    merged.set(task.id, task);
+  }
+
+  return sortTaskRecords(Array.from(merged.values()));
+}
+
 function normalizeTaskScheduleKind(value: unknown): TaskScheduleKind | undefined {
   if (value === "once" || value === "repeat") {
     return value;
@@ -594,6 +856,56 @@ function listGatewayTasks(gatewayIdValue: string): TaskRecord[] {
       }
       return left.createdAt.localeCompare(right.createdAt);
     });
+}
+
+function buildCronTaskMutationParams(normalized: {
+  title: string;
+  prompt: string;
+  scheduleKind: TaskScheduleKind;
+  scheduleAt?: string;
+  repeatAmount?: number;
+  repeatUnit?: TaskRepeatUnit;
+  enabled: boolean;
+}): Record<string, unknown> | null {
+  const scheduleAt = normalized.scheduleAt?.trim();
+  const payload = {
+    kind: "agentTurn",
+    message: normalized.prompt,
+  };
+
+  if (normalized.scheduleKind === "once") {
+    if (!scheduleAt) {
+      return null;
+    }
+    return {
+      name: normalized.title,
+      enabled: normalized.enabled,
+      deleteAfterRun: true,
+      schedule: { kind: "at", at: scheduleAt },
+      payload,
+    };
+  }
+
+  if (!scheduleAt || !normalized.repeatAmount || !normalized.repeatUnit) {
+    return null;
+  }
+
+  const schedule: Record<string, unknown> = {
+    kind: "every",
+    everyMs: taskRepeatIntervalMs(normalized.repeatAmount, normalized.repeatUnit),
+  };
+  const anchorMs = Date.parse(scheduleAt);
+  if (Number.isFinite(anchorMs) && anchorMs >= 0) {
+    schedule.anchorMs = Math.round(anchorMs);
+  }
+
+  return {
+    name: normalized.title,
+    enabled: normalized.enabled,
+    deleteAfterRun: false,
+    schedule,
+    payload,
+  };
 }
 
 function broadcastTaskUpdate(gatewayIdValue: string, taskId: string, event = "task_updated"): void {
@@ -763,6 +1075,25 @@ type HostSkillsStatusReport = {
   skills?: HostSkillStatusEntry[];
 };
 
+type HostBackupRecord = {
+  id?: string;
+  title?: string;
+  detail?: string;
+  filename?: string;
+  sizeBytes?: number;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+type HostBackupListReport = {
+  backups?: HostBackupRecord[];
+  maxBackups?: number;
+};
+
+type HostBackupMutationReport = HostBackupListReport & {
+  backup?: HostBackupRecord;
+};
+
 function decodePathSegment(value: string): string {
   try {
     return decodeURIComponent(value);
@@ -787,18 +1118,65 @@ function parseStringRecord(value: unknown): Record<string, string> | undefined {
 
 function hostCommandErrorResponse(error: unknown): { status: number; body: { error: string } } {
   const message = error instanceof Error ? error.message : String(error);
-  const code = message.split(":")[0]?.trim() || "host_error";
-  switch (code) {
+  const separatorIndex = message.indexOf(":");
+  const rawCode = separatorIndex > 0 ? message.slice(0, separatorIndex).trim() : message.trim();
+  const detail = separatorIndex > 0 ? message.slice(separatorIndex + 1).trim() : "";
+  const normalizedCode = rawCode.replace(/[\s-]+/g, "_").toUpperCase();
+  const errorCode = rawCode.replace(/[\s-]+/g, "_").toLowerCase() || "host_error";
+  const invalidRequestBody = { error: "invalid_request" };
+  const timeoutBody = { error: "timeout" };
+  const gatewayOfflineBody = { error: "gateway_offline" };
+
+  switch (normalizedCode) {
+  case "GATEWAY_OFFLINE":
+    return { status: 503, body: gatewayOfflineBody };
+  case "TIMEOUT":
+  case "AGENT_TIMEOUT":
+    return { status: 504, body: timeoutBody };
+  case "INVALID_REQUEST":
+    return { status: 400, body: invalidRequestBody };
+  case "UNAVAILABLE":
+    return { status: 503, body: { error: errorCode } };
+  case "NOT_LINKED":
+  case "NOT_PAIRED":
+    return { status: 403, body: { error: errorCode } };
+  case "BACKUP_NOT_FOUND":
+  case "OPENCLAW_CONFIG_NOT_FOUND":
+  case "OPENCLAW_CONFIG_DIR_NOT_FOUND":
+  case "SKILL_NOT_FOUND":
+    return { status: 404, body: { error: errorCode } };
+  }
+
+  if (normalizedCode.endsWith("NOT_FOUND") || detail.toLowerCase().includes("not found")) {
+    return { status: 404, body: { error: normalizedCode === "INVALID_REQUEST" ? "task_not_found" : errorCode } };
+  }
+  if (normalizedCode.endsWith("REQUIRED") || normalizedCode.endsWith("INVALID")) {
+    return { status: 400, body: { error: errorCode } };
+  }
+
+  switch (errorCode) {
   case "gateway_offline":
-    return { status: 503, body: { error: code } };
+    return { status: 503, body: gatewayOfflineBody };
   case "timeout":
-    return { status: 504, body: { error: code } };
+    return { status: 504, body: timeoutBody };
+  case "backup_not_found":
+    return { status: 404, body: { error: "backup_not_found" } };
+  case "backup_id_required":
+  case "backup_filename_invalid":
+  case "backup_title_too_long":
+  case "backup_detail_too_long":
+    return { status: 400, body: { error: errorCode } };
+  case "backup_limit_reached":
+    return { status: 409, body: { error: errorCode } };
+  case "openclaw_config_not_found":
+  case "openclaw_config_dir_not_found":
+    return { status: 404, body: { error: errorCode } };
   case "skill_not_found":
-    return { status: 404, body: { error: code } };
+    return { status: 404, body: { error: errorCode } };
   case "skill_blocked":
-    return { status: 403, body: { error: code } };
+    return { status: 403, body: { error: errorCode } };
   default:
-    return { status: 502, body: { error: code } };
+    return { status: 502, body: { error: errorCode } };
   }
 }
 
@@ -1302,6 +1680,194 @@ async function handleGatewaySkills(req: IncomingMessage, res: ServerResponse, ga
   }
 }
 
+async function handleGatewayBackups(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+
+  if (req.method === "GET") {
+    try {
+      const payload = await dispatchHostCommand(gatewayIdValue, userId, "clawpilot.backup.list", {});
+      touchGateway(gatewayIdValue, {
+        relayStatus: "relay_connected",
+        hostStatus: "healthy",
+        openclawStatus: "healthy",
+        lastSeenAt: nowIso(),
+      });
+      schedulePersist();
+      const result = (payload ?? {}) as HostBackupListReport;
+      json(res, 200, {
+        backups: Array.isArray(result.backups) ? result.backups : [],
+        maxBackups: typeof result.maxBackups === "number" ? result.maxBackups : 5,
+      });
+    } catch (error) {
+      const response = hostCommandErrorResponse(error);
+      json(res, response.status, response.body);
+    }
+    return;
+  }
+
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+
+  if (req.method === "POST") {
+    try {
+      const payload = await dispatchHostCommand(gatewayIdValue, userId, "clawpilot.backup.create", {
+        title: body.title,
+        detail: body.detail,
+        filename: body.filename,
+      });
+      touchGateway(gatewayIdValue, {
+        relayStatus: "relay_connected",
+        hostStatus: "healthy",
+        openclawStatus: "healthy",
+        lastSeenAt: nowIso(),
+      });
+      schedulePersist();
+      const result = (payload ?? {}) as HostBackupMutationReport;
+      json(res, 200, {
+        backup: result.backup,
+        backups: Array.isArray(result.backups) ? result.backups : [],
+        maxBackups: typeof result.maxBackups === "number" ? result.maxBackups : 5,
+      });
+    } catch (error) {
+      const response = hostCommandErrorResponse(error);
+      json(res, response.status, response.body);
+    }
+    return;
+  }
+
+  json(res, 405, { error: "method_not_allowed" });
+}
+
+async function handleGatewayBackup(
+  req: IncomingMessage,
+  res: ServerResponse,
+  gatewayIdValue: string,
+  backupIdValue: string,
+): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  if (req.method === "PATCH") {
+    const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+    try {
+      const payload = await dispatchHostCommand(gatewayIdValue, userId, "clawpilot.backup.update", {
+        backupId: backupIdValue,
+        title: body.title,
+        detail: body.detail,
+        filename: body.filename,
+      });
+      touchGateway(gatewayIdValue, {
+        relayStatus: "relay_connected",
+        hostStatus: "healthy",
+        openclawStatus: "healthy",
+        lastSeenAt: nowIso(),
+      });
+      schedulePersist();
+      const result = (payload ?? {}) as HostBackupMutationReport;
+      json(res, 200, {
+        backup: result.backup,
+        backups: Array.isArray(result.backups) ? result.backups : [],
+        maxBackups: typeof result.maxBackups === "number" ? result.maxBackups : 5,
+      });
+    } catch (error) {
+      const response = hostCommandErrorResponse(error);
+      json(res, response.status, response.body);
+    }
+    return;
+  }
+
+  if (req.method === "DELETE") {
+    try {
+      const payload = await dispatchHostCommand(gatewayIdValue, userId, "clawpilot.backup.delete", {
+        backupId: backupIdValue,
+      });
+      touchGateway(gatewayIdValue, {
+        relayStatus: "relay_connected",
+        hostStatus: "healthy",
+        openclawStatus: "healthy",
+        lastSeenAt: nowIso(),
+      });
+      schedulePersist();
+      const result = (payload ?? {}) as HostBackupMutationReport;
+      json(res, 200, {
+        backup: result.backup,
+        backups: Array.isArray(result.backups) ? result.backups : [],
+        maxBackups: typeof result.maxBackups === "number" ? result.maxBackups : 5,
+      });
+    } catch (error) {
+      const response = hostCommandErrorResponse(error);
+      json(res, response.status, response.body);
+    }
+    return;
+  }
+
+  json(res, 405, { error: "method_not_allowed" });
+}
+
+async function handleGatewayBackupRestore(
+  req: IncomingMessage,
+  res: ServerResponse,
+  gatewayIdValue: string,
+  backupIdValue: string,
+): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+  if (req.method !== "POST") {
+    json(res, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "clawpilot.backup.restore", {
+      backupId: backupIdValue,
+    });
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    schedulePersist();
+    const result = (payload ?? {}) as HostBackupMutationReport;
+    json(res, 200, {
+      backup: result.backup,
+      backups: Array.isArray(result.backups) ? result.backups : [],
+      maxBackups: typeof result.maxBackups === "number" ? result.maxBackups : 5,
+    });
+  } catch (error) {
+    const response = hostCommandErrorResponse(error);
+    json(res, response.status, response.body);
+  }
+}
+
 async function handleGatewayTasks(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
   const userId = requireAuthenticatedUser(req, res);
   if (!userId) return;
@@ -1312,7 +1878,20 @@ async function handleGatewayTasks(req: IncomingMessage, res: ServerResponse, gat
   }
 
   if (req.method === "GET") {
-    json(res, 200, { items: listGatewayTasks(gatewayIdValue) });
+    try {
+      const items = await listGatewayTasksForMobile(gatewayIdValue, userId);
+      touchGateway(gatewayIdValue, {
+        relayStatus: "relay_connected",
+        hostStatus: "healthy",
+        openclawStatus: "healthy",
+        lastSeenAt: nowIso(),
+      });
+      schedulePersist();
+      json(res, 200, { items });
+    } catch (error) {
+      const response = hostCommandErrorResponse(error);
+      json(res, response.status, response.body);
+    }
     return;
   }
 
@@ -1329,48 +1908,32 @@ async function handleGatewayTasks(req: IncomingMessage, res: ServerResponse, gat
       json(res, 400, { error: normalized.error });
       return;
     }
-
-    const taskId = `task_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const now = nowIso();
-    const task: TaskRecord = {
-      id: taskId,
-      gatewayId: gatewayIdValue,
-      userId,
-      title: normalized.title,
-      prompt: normalized.prompt,
-      scheduleKind: normalized.scheduleKind,
-      scheduleAt: normalized.scheduleAt,
-      repeatAmount: normalized.repeatAmount,
-      repeatUnit: normalized.repeatUnit,
-      enabled: normalized.enabled,
-      lastResult: "",
-      nextRunAt: normalized.scheduleKind === "repeat" ? computeNextTaskRun({
-        id: taskId,
-        gatewayId: gatewayIdValue,
-        userId,
-        title: normalized.title,
-        prompt: normalized.prompt,
-        scheduleKind: normalized.scheduleKind,
-        scheduleAt: normalized.scheduleAt,
-        repeatAmount: normalized.repeatAmount,
-        repeatUnit: normalized.repeatUnit,
-        enabled: normalized.enabled,
-        lastResult: "",
-        nextRunAt: undefined,
-        createdAt: now,
-        updatedAt: now,
-      }, new Date(now)) : normalized.scheduleAt,
-      createdAt: now,
-      updatedAt: now,
-    };
-    if (!task.nextRunAt && task.scheduleKind === "once") {
-      task.nextRunAt = task.scheduleAt;
+    const mutationParams = buildCronTaskMutationParams(normalized);
+    if (!mutationParams) {
+      json(res, 400, { error: "invalid_request" });
+      return;
     }
-    store.putTask(task);
-    await persist();
-    broadcastTaskUpdate(gatewayIdValue, task.id);
-    scheduleTaskSweep(0);
-    json(res, 200, { task });
+
+    try {
+      const payload = await dispatchHostCommand(gatewayIdValue, userId, "cron.add", mutationParams);
+      touchGateway(gatewayIdValue, {
+        relayStatus: "relay_connected",
+        hostStatus: "healthy",
+        openclawStatus: "healthy",
+        lastSeenAt: nowIso(),
+      });
+      schedulePersist();
+      const task = buildTaskRecordFromCronResponse(gatewayIdValue, userId, payload);
+      if (!task) {
+        json(res, 502, { error: "invalid_cron_response" });
+        return;
+      }
+      broadcastTaskUpdate(gatewayIdValue, task.id);
+      json(res, 200, { task });
+    } catch (error) {
+      const response = hostCommandErrorResponse(error);
+      json(res, response.status, response.body);
+    }
     return;
   }
 
@@ -1391,9 +1954,70 @@ async function handleGatewayTask(
     return;
   }
 
-  const task = store.snapshot().tasks[taskIdValue];
-  if (!task || task.gatewayId !== gatewayIdValue) {
+  const legacyTask = store.snapshot().tasks[taskIdValue];
+  if (legacyTask && legacyTask.gatewayId !== gatewayIdValue) {
     json(res, 404, { error: "task_not_found" });
+    return;
+  }
+  if (legacyTask && legacyTask.gatewayId === gatewayIdValue) {
+    if (req.method === "DELETE") {
+      if (membership.role === "viewer") {
+        json(res, 403, { error: "forbidden" });
+        return;
+      }
+      const pending = pendingTaskRunsByTaskID.get(taskIdValue);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        pendingTaskRunsByTaskID.delete(taskIdValue);
+      }
+      store.removeTask(taskIdValue);
+      await persist();
+      broadcastTaskUpdate(gatewayIdValue, taskIdValue);
+      scheduleTaskSweep(0);
+      json(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method !== "PATCH") {
+      json(res, 405, { error: "method_not_allowed" });
+      return;
+    }
+
+    if (membership.role === "viewer") {
+      json(res, 403, { error: "forbidden" });
+      return;
+    }
+    const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+    const normalized = normalizeTaskBody(body, legacyTask);
+    if (normalized.error) {
+      json(res, 400, { error: normalized.error });
+      return;
+    }
+
+    legacyTask.title = normalized.title;
+    legacyTask.prompt = normalized.prompt;
+    legacyTask.scheduleKind = normalized.scheduleKind;
+    legacyTask.scheduleAt = normalized.scheduleAt;
+    legacyTask.repeatAmount = normalized.repeatAmount;
+    legacyTask.repeatUnit = normalized.repeatUnit;
+    legacyTask.enabled = normalized.enabled;
+
+    const scheduleFieldsChanged =
+      body.title !== undefined ||
+      body.prompt !== undefined ||
+      body.scheduleKind !== undefined ||
+      body.scheduleAt !== undefined ||
+      body.repeatAmount !== undefined ||
+      body.repeatUnit !== undefined;
+    if (scheduleFieldsChanged || legacyTask.enabled) {
+      legacyTask.nextRunAt = computeNextTaskRun(legacyTask, new Date());
+    }
+    legacyTask.updatedAt = nowIso();
+    store.putTask(legacyTask);
+    await persist();
+    broadcastTaskUpdate(gatewayIdValue, legacyTask.id);
+    scheduleTaskSweep(0);
+    json(res, 200, { task: legacyTask });
     return;
   }
 
@@ -1402,16 +2026,30 @@ async function handleGatewayTask(
       json(res, 403, { error: "forbidden" });
       return;
     }
-    const pending = pendingTaskRunsByTaskID.get(taskIdValue);
-    if (pending) {
-      clearTimeout(pending.timeout);
-      pendingTaskRunsByTaskID.delete(taskIdValue);
+    try {
+      const payload = await dispatchHostCommand(gatewayIdValue, userId, "cron.remove", {
+        id: taskIdValue,
+      });
+      touchGateway(gatewayIdValue, {
+        relayStatus: "relay_connected",
+        hostStatus: "healthy",
+        openclawStatus: "healthy",
+        lastSeenAt: nowIso(),
+      });
+      schedulePersist();
+      const result = payload && typeof payload === "object" && !Array.isArray(payload)
+        ? (payload as { removed?: unknown })
+        : undefined;
+      if (result?.removed === false) {
+        json(res, 404, { error: "task_not_found" });
+        return;
+      }
+      broadcastTaskUpdate(gatewayIdValue, taskIdValue, "task_updated");
+      json(res, 200, { ok: true });
+    } catch (error) {
+      const response = hostCommandErrorResponse(error);
+      json(res, response.status, response.body);
     }
-    store.removeTask(taskIdValue);
-    await persist();
-    broadcastTaskUpdate(gatewayIdValue, taskIdValue);
-    scheduleTaskSweep(0);
-    json(res, 200, { ok: true });
     return;
   }
 
@@ -1426,36 +2064,41 @@ async function handleGatewayTask(
   }
 
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
-  const normalized = normalizeTaskBody(body, task);
+  const normalized = normalizeTaskBody(body);
   if (normalized.error) {
     json(res, 400, { error: normalized.error });
     return;
   }
 
-  task.title = normalized.title;
-  task.prompt = normalized.prompt;
-  task.scheduleKind = normalized.scheduleKind;
-  task.scheduleAt = normalized.scheduleAt;
-  task.repeatAmount = normalized.repeatAmount;
-  task.repeatUnit = normalized.repeatUnit;
-  task.enabled = normalized.enabled;
-
-  const scheduleFieldsChanged =
-    body.title !== undefined ||
-    body.prompt !== undefined ||
-    body.scheduleKind !== undefined ||
-    body.scheduleAt !== undefined ||
-    body.repeatAmount !== undefined ||
-    body.repeatUnit !== undefined;
-  if (scheduleFieldsChanged || task.enabled) {
-    task.nextRunAt = computeNextTaskRun(task, new Date());
+  const patch = buildCronTaskMutationParams(normalized);
+  if (!patch) {
+    json(res, 400, { error: "invalid_request" });
+    return;
   }
-  task.updatedAt = nowIso();
-  store.putTask(task);
-  await persist();
-  broadcastTaskUpdate(gatewayIdValue, task.id);
-  scheduleTaskSweep(0);
-  json(res, 200, { task });
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "cron.update", {
+      id: taskIdValue,
+      patch,
+    });
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    schedulePersist();
+    const task = buildTaskRecordFromCronResponse(gatewayIdValue, userId, payload);
+    if (!task) {
+      json(res, 502, { error: "invalid_cron_response" });
+      return;
+    }
+    broadcastTaskUpdate(gatewayIdValue, task.id);
+    json(res, 200, { task });
+  } catch (error) {
+    const response = hostCommandErrorResponse(error);
+    json(res, response.status, response.body);
+  }
 }
 
 async function handleGatewaySkillUpdate(
@@ -1975,6 +2618,34 @@ const server = createServer((req, res) => {
         return;
       }
 
+      const backupsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/backups$/);
+      if (backupsMatch && (req.method === "GET" || req.method === "POST")) {
+        await handleGatewayBackups(req, res, decodePathSegment(backupsMatch[1]));
+        return;
+      }
+
+      const backupRestoreMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/backups\/([^/]+)\/restore$/);
+      if (backupRestoreMatch && req.method === "POST") {
+        await handleGatewayBackupRestore(
+          req,
+          res,
+          decodePathSegment(backupRestoreMatch[1]),
+          decodePathSegment(backupRestoreMatch[2]),
+        );
+        return;
+      }
+
+      const backupDetailMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/backups\/([^/]+)$/);
+      if (backupDetailMatch && (req.method === "PATCH" || req.method === "DELETE")) {
+        await handleGatewayBackup(
+          req,
+          res,
+          decodePathSegment(backupDetailMatch[1]),
+          decodePathSegment(backupDetailMatch[2]),
+        );
+        return;
+      }
+
       const tasksMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/tasks$/);
       if (tasksMatch && (req.method === "GET" || req.method === "POST")) {
         await handleGatewayTasks(req, res, decodePathSegment(tasksMatch[1]));
@@ -2263,7 +2934,9 @@ hostWsServer.on("connection", async (socket, req) => {
       if (message.ok) {
         pendingHostCommand.resolve(message.payload);
       } else {
-        pendingHostCommand.reject(new Error(message.error?.message ?? "host_error"));
+        const code = message.error?.code ?? "host_error";
+        const messageText = message.error?.message ?? "host_error";
+        pendingHostCommand.reject(new Error(`${code}: ${messageText}`));
       }
     }
   });
