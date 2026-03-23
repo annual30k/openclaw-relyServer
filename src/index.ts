@@ -2064,6 +2064,38 @@ async function handleGatewayTask(
   }
 
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  // Mobile pause/resume sends only `{ enabled }`, so allow a minimal cron patch here.
+  const enabledOnlyPatch =
+    typeof body.enabled === "boolean" &&
+    Object.keys(body).every((key) => key === "enabled");
+
+  if (enabledOnlyPatch) {
+    try {
+      const payload = await dispatchHostCommand(gatewayIdValue, userId, "cron.update", {
+        id: taskIdValue,
+        patch: { enabled: body.enabled },
+      });
+      touchGateway(gatewayIdValue, {
+        relayStatus: "relay_connected",
+        hostStatus: "healthy",
+        openclawStatus: "healthy",
+        lastSeenAt: nowIso(),
+      });
+      schedulePersist();
+      const task = buildTaskRecordFromCronResponse(gatewayIdValue, userId, payload);
+      if (!task) {
+        json(res, 502, { error: "invalid_cron_response" });
+        return;
+      }
+      broadcastTaskUpdate(gatewayIdValue, task.id);
+      json(res, 200, { task });
+    } catch (error) {
+      const response = hostCommandErrorResponse(error);
+      json(res, response.status, response.body);
+    }
+    return;
+  }
+
   const normalized = normalizeTaskBody(body);
   if (normalized.error) {
     json(res, 400, { error: normalized.error });
