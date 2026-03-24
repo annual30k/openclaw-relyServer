@@ -229,8 +229,8 @@ function ensureRateLimit(scope: string, key: string): boolean {
   return true;
 }
 
-function toPositiveInteger(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+function toNonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
 }
 
 function normalizeEventTimestamp(value: unknown): number | undefined {
@@ -296,22 +296,22 @@ function extractContextMetrics(
       : undefined;
 
   const contextUsage =
-    toPositiveInteger(payloadRecord?.contextUsage) ??
-    toPositiveInteger(payloadRecord?.promptTokens) ??
-    toPositiveInteger(payloadRecord?.prompt_tokens) ??
-    toPositiveInteger(payloadRecord?.inputTokens) ??
-    toPositiveInteger(payloadRecord?.input_tokens) ??
-    toPositiveInteger(usageRecord?.promptTokens) ??
-    toPositiveInteger(usageRecord?.prompt_tokens) ??
-    toPositiveInteger(usageRecord?.inputTokens) ??
-    toPositiveInteger(usageRecord?.input_tokens);
+    toNonNegativeInteger(payloadRecord?.contextUsage) ??
+    toNonNegativeInteger(payloadRecord?.promptTokens) ??
+    toNonNegativeInteger(payloadRecord?.prompt_tokens) ??
+    toNonNegativeInteger(payloadRecord?.inputTokens) ??
+    toNonNegativeInteger(payloadRecord?.input_tokens) ??
+    toNonNegativeInteger(usageRecord?.promptTokens) ??
+    toNonNegativeInteger(usageRecord?.prompt_tokens) ??
+    toNonNegativeInteger(usageRecord?.inputTokens) ??
+    toNonNegativeInteger(usageRecord?.input_tokens);
   const contextLimit =
-    toPositiveInteger(payloadRecord?.contextLimit) ??
-    toPositiveInteger(payloadRecord?.maxInputTokens) ??
-    toPositiveInteger(payloadRecord?.max_input_tokens) ??
-    toPositiveInteger(usageRecord?.contextLimit) ??
-    toPositiveInteger(usageRecord?.maxInputTokens) ??
-    toPositiveInteger(usageRecord?.max_input_tokens);
+    toNonNegativeInteger(payloadRecord?.contextLimit) ??
+    toNonNegativeInteger(payloadRecord?.maxInputTokens) ??
+    toNonNegativeInteger(payloadRecord?.max_input_tokens) ??
+    toNonNegativeInteger(usageRecord?.contextLimit) ??
+    toNonNegativeInteger(usageRecord?.maxInputTokens) ??
+    toNonNegativeInteger(usageRecord?.max_input_tokens);
 
   return {
     contextUsage,
@@ -2338,11 +2338,20 @@ async function handleGatewayChatSessions(req: IncomingMessage, res: ServerRespon
     return;
   }
 
-  const requestedLimit = Number.parseInt(requestUrl.searchParams.get("limit") ?? "20", 10);
-  const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 100)) : 20;
+  const requestedLimit = Number.parseInt(requestUrl.searchParams.get("limit") ?? "120", 10);
+  const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 120)) : 120;
+  const requestedActiveMinutes = Number.parseInt(requestUrl.searchParams.get("activeMinutes") ?? "", 10);
+  const activeMinutes = Number.isFinite(requestedActiveMinutes) ? Math.max(1, requestedActiveMinutes) : undefined;
+  const includeGlobal = requestUrl.searchParams.get("includeGlobal") !== "false";
+  const includeUnknown = requestUrl.searchParams.get("includeUnknown") === "true";
 
   try {
-    const payload = await dispatchHostCommand(gatewayIdValue, userId, "chat.list", { limit });
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "sessions.list", {
+      limit,
+      ...(activeMinutes !== undefined ? { activeMinutes } : {}),
+      includeGlobal,
+      includeUnknown,
+    });
     touchGateway(gatewayIdValue, {
       relayStatus: "relay_connected",
       hostStatus: "healthy",
@@ -2355,39 +2364,61 @@ async function handleGatewayChatSessions(req: IncomingMessage, res: ServerRespon
       ? (payload as Record<string, unknown>)
       : undefined;
     const rawItems =
-      Array.isArray(payloadRecord?.items) ? payloadRecord.items
-        : Array.isArray(payloadRecord?.sessions) ? payloadRecord.sessions
+      Array.isArray(payloadRecord?.sessions) ? payloadRecord.sessions
+        : Array.isArray(payloadRecord?.items) ? payloadRecord.items
           : Array.isArray(payloadRecord?.list) ? payloadRecord.list
             : Array.isArray(payload) ? payload as unknown[]
               : [];
 
+    type MobileChatSessionItem = {
+      sessionKey: string;
+      lastActivityAt?: string;
+      displayName?: string;
+      label?: string;
+      derivedTitle?: string;
+      kind?: string;
+    };
+
     const deduped = new Set<string>();
-    const items = rawItems.flatMap((entry) => {
+    const items: MobileChatSessionItem[] = [];
+    for (const entry of rawItems) {
       if (typeof entry === "string") {
         const sessionKey = entry.trim();
-        if (!sessionKey || deduped.has(sessionKey)) return [];
+        if (!sessionKey || deduped.has(sessionKey)) continue;
         deduped.add(sessionKey);
-        return [{ sessionKey, lastActivityAt: undefined }];
+        items.push({ sessionKey });
+        continue;
       }
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
       const record = entry as Record<string, unknown>;
       const sessionKeyRaw =
-        typeof record.sessionKey === "string" ? record.sessionKey
-          : typeof record.key === "string" ? record.key
+        typeof record.key === "string" ? record.key
+          : typeof record.sessionKey === "string" ? record.sessionKey
             : typeof record.id === "string" ? record.id
               : typeof record.session === "string" ? record.session
                 : undefined;
       const sessionKey = sessionKeyRaw?.trim();
-      if (!sessionKey || deduped.has(sessionKey)) return [];
+      if (!sessionKey || deduped.has(sessionKey)) continue;
       deduped.add(sessionKey);
       const lastActivityAt =
-        normalizeSessionTimestamp(record.lastActivityAt)
+        normalizeSessionTimestamp(record.updatedAt)
+        ?? normalizeSessionTimestamp(record.lastActivityAt)
         ?? normalizeSessionTimestamp(record.lastMessageAt)
-        ?? normalizeSessionTimestamp(record.updatedAt)
         ?? normalizeSessionTimestamp(record.lastSeenAt)
         ?? normalizeSessionTimestamp(record.createdAt);
-      return [{ sessionKey, lastActivityAt }];
-    });
+      const displayName = typeof record.displayName === "string" ? record.displayName.trim() : undefined;
+      const label = typeof record.label === "string" ? record.label.trim() : undefined;
+      const derivedTitle = typeof record.derivedTitle === "string" ? record.derivedTitle.trim() : undefined;
+      const kind = typeof record.kind === "string" ? record.kind.trim() : undefined;
+      items.push({
+        sessionKey,
+        lastActivityAt,
+        displayName: displayName || undefined,
+        label: label || undefined,
+        derivedTitle: derivedTitle || undefined,
+        kind: kind || undefined,
+      });
+    }
 
     items.sort((a, b) => {
       const aTime = a.lastActivityAt ? Date.parse(a.lastActivityAt) : 0;
@@ -2873,10 +2904,10 @@ hostWsServer.on("connection", async (socket, req) => {
       if (currentModel) {
         runtimePatch.currentModel = currentModel;
       }
-      if (contextUsage) {
+      if (contextUsage !== undefined) {
         runtimePatch.contextUsage = contextUsage;
       }
-      if (contextLimit) {
+      if (contextLimit !== undefined) {
         runtimePatch.contextLimit = contextLimit;
       }
       touchGateway(gatewayIdValue, runtimePatch);
@@ -2888,7 +2919,7 @@ hostWsServer.on("connection", async (socket, req) => {
         event: message.event,
         payload: normalizedPayload,
       });
-      if (currentModel || contextUsage || contextLimit) {
+      if (currentModel !== undefined || contextUsage !== undefined || contextLimit !== undefined) {
         broadcastToGatewayMembers(gatewayIdValue, {
           type: "presence",
           gatewayId: gatewayIdValue,
