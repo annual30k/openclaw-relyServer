@@ -2432,6 +2432,55 @@ async function handleGatewayChatSessions(req: IncomingMessage, res: ServerRespon
   }
 }
 
+async function handleGatewayChatSessionDelete(
+  req: IncomingMessage,
+  res: ServerResponse,
+  gatewayIdValue: string,
+  requestUrl: URL,
+): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  if (membership.role === "viewer") {
+    json(res, 403, { error: "forbidden" });
+    return;
+  }
+
+  const sessionKey = requestUrl.searchParams.get("sessionKey")?.trim();
+  if (!sessionKey) {
+    json(res, 400, { error: "session_key_required" });
+    return;
+  }
+  const deleteTranscript = requestUrl.searchParams.get("deleteTranscript") !== "false";
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "sessions.delete", {
+      key: sessionKey,
+      deleteTranscript,
+    });
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    schedulePersist();
+
+    const payloadRecord =
+      payload && typeof payload === "object" && !Array.isArray(payload)
+        ? (payload as Record<string, unknown>)
+        : undefined;
+    const deleted = payloadRecord?.deleted === true;
+    json(res, 200, { ok: true, deleted });
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
 async function handleGatewayDefaultModelSelect(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
   const body = (await readJson<Record<string, unknown>>(req)) ?? {};
   const userId = requireAuthenticatedUser(req, res);
@@ -2741,6 +2790,10 @@ const server = createServer((req, res) => {
       const chatSessionsMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/sessions$/);
       if (chatSessionsMatch && req.method === "GET") {
         await handleGatewayChatSessions(req, res, chatSessionsMatch[1], requestUrl);
+        return;
+      }
+      if (chatSessionsMatch && req.method === "DELETE") {
+        await handleGatewayChatSessionDelete(req, res, chatSessionsMatch[1], requestUrl);
         return;
       }
 
