@@ -2247,27 +2247,23 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
       ? result.messages.flatMap((entry, index) => {
           if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
           const record = entry as Record<string, unknown>;
-          const role = typeof record.role === "string" ? record.role : "assistant";
+          const rawRole = typeof record.role === "string" ? record.role : "assistant";
           const createdAt =
             normalizeSessionTimestamp(record.createdAt)
             ?? normalizeSessionTimestamp(record.created_at)
             ?? normalizeSessionTimestamp(record.timestamp)
             ?? normalizeSessionTimestamp(record.ts)
             ?? normalizeSessionTimestamp(record.time);
-          const content = Array.isArray(record.content)
-            ? record.content
-                .filter((block): block is Record<string, unknown> => Boolean(block) && typeof block === "object" && !Array.isArray(block))
-                .filter((block) => block.type === "text" && typeof block.text === "string")
-                .map((block) => String(block.text))
-                .join("\n\n")
-                .trim()
-            : "";
-          const normalizedContent = normalizeHistoryMessageContent(role, content);
-          if (!normalizedContent) return [];
+          const contentBlocks = extractHistoryContentBlocks(record);
+          const contentText = extractHistoryTextFromBlocks(contentBlocks);
+          const role = hasToolContentBlocks(contentBlocks) ? "tool" : rawRole;
+          const normalizedContent = normalizeHistoryMessageContent(role, contentText);
+          if (!normalizedContent && contentBlocks.length === 0) return [];
           return [{
-            id: `history-${index}`,
+            id: typeof record.id === "string" && record.id.trim() ? record.id.trim() : `history-${index}`,
             role,
             content: normalizedContent,
+            contentBlocks,
             createdAt,
           }];
         })
@@ -2327,6 +2323,43 @@ function normalizeHistoryMessageContent(role: string, content: string): string {
 
   const normalized = trailingBlock.replace(/^\[[^\]]+\]\s*/, "").trim();
   return normalized || trimmed;
+}
+
+function extractHistoryContentBlocks(record: Record<string, unknown>): Record<string, unknown>[] {
+  if (!Array.isArray(record.content)) {
+    return [];
+  }
+
+  return record.content.flatMap((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      return [];
+    }
+    return [block as Record<string, unknown>];
+  });
+}
+
+function extractHistoryTextFromBlocks(blocks: Record<string, unknown>[]): string {
+  return blocks
+    .filter((block) => {
+      const type = typeof block.type === "string" ? block.type.trim().toLowerCase() : "";
+      return type === "text" || type === "output_text" || type === "input_text";
+    })
+    .map((block) => (typeof block.text === "string" ? block.text : ""))
+    .filter((text) => text.trim().length > 0)
+    .join("\n\n")
+    .trim();
+}
+
+function hasToolContentBlocks(blocks: Record<string, unknown>[]): boolean {
+  return blocks.some((block) => {
+    const type = typeof block.type === "string" ? block.type.trim().toLowerCase() : "";
+    return type === "toolcall"
+      || type === "tool_call"
+      || type === "tooluse"
+      || type === "tool_use"
+      || type === "toolresult"
+      || type === "tool_result";
+  });
 }
 
 async function handleGatewayChatSessions(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string, requestUrl: URL): Promise<void> {
