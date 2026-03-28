@@ -341,6 +341,72 @@ function buildGatewaySummary(gateway: GatewayRecord) {
   };
 }
 
+function resolveDesktopChatReadiness(payload: unknown): { ready: boolean; reason?: string } {
+  const entries: unknown[] = Array.isArray(payload)
+    ? payload
+    : payload && typeof payload === "object" && !Array.isArray(payload) && Array.isArray((payload as Record<string, unknown>).presence)
+      ? ((payload as Record<string, unknown>).presence as unknown[])
+      : [];
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const mode = typeof record.mode === "string" ? record.mode.trim().toLowerCase() : "";
+    const reason = typeof record.reason === "string" ? record.reason.trim().toLowerCase() : "";
+    if (reason === "webchat-open") {
+      return { ready: true, reason: "webchat-open" };
+    }
+    if (
+      mode === "webchat" &&
+      reason !== "disconnect" &&
+      reason !== "webchat-closed"
+    ) {
+      return { ready: true, reason: reason || "webchat-connect" };
+    }
+  }
+
+  return { ready: false };
+}
+
+function decodeGatewayLogLine(line: unknown): string {
+  if (typeof line !== "string") {
+    return "";
+  }
+  try {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    const primary = typeof parsed["2"] === "string" ? parsed["2"] : "";
+    if (primary) {
+      return primary;
+    }
+    const fallback = typeof parsed["0"] === "string" ? parsed["0"] : "";
+    return fallback;
+  } catch {
+    return line;
+  }
+}
+
+function resolveDesktopChatReadinessFromLogs(payload: unknown): { ready: boolean; reason?: string } {
+  const lines =
+    payload && typeof payload === "object" && !Array.isArray(payload) && Array.isArray((payload as Record<string, unknown>).lines)
+      ? ((payload as Record<string, unknown>).lines as unknown[])
+      : [];
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const message = decodeGatewayLogLine(lines[index]).trim().toLowerCase();
+    if (!message) {
+      continue;
+    }
+    if (message.includes("webchat connected")) {
+      return { ready: true, reason: "webchat-log-connect" };
+    }
+    if (message.includes("webchat disconnected")) {
+      return { ready: false, reason: "webchat-log-disconnect" };
+    }
+  }
+
+  return { ready: false };
+}
+
 function sendSocket(socket: WebSocket, envelope: RelayEnvelope): void {
   if (socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(envelope));
@@ -2274,6 +2340,38 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
   }
 }
 
+async function handleGatewayChatReady(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const userId = requireAuthenticatedUser(req, res);
+  if (!userId) return;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "system-presence", {});
+    let readiness = resolveDesktopChatReadiness(payload);
+    if (!readiness.ready) {
+      const logsPayload = await dispatchHostCommand(gatewayIdValue, userId, "logs.tail", {
+        limit: 200,
+        maxBytes: 200_000,
+      });
+      readiness = resolveDesktopChatReadinessFromLogs(logsPayload);
+    }
+    touchGateway(gatewayIdValue, {
+      relayStatus: "relay_connected",
+      hostStatus: "healthy",
+      openclawStatus: "healthy",
+      lastSeenAt: nowIso(),
+    });
+    schedulePersist();
+    json(res, 200, readiness);
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
 function normalizeSessionTimestamp(value: unknown): string | undefined {
   if (value instanceof Date && Number.isFinite(value.getTime())) {
     return value.toISOString();
@@ -2817,6 +2915,12 @@ const server = createServer((req, res) => {
       const chatHistoryMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/history$/);
       if (chatHistoryMatch && req.method === "GET") {
         await handleGatewayChatHistory(req, res, chatHistoryMatch[1], requestUrl);
+        return;
+      }
+
+      const chatReadyMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/chat\/ready$/);
+      if (chatReadyMatch && req.method === "GET") {
+        await handleGatewayChatReady(req, res, chatReadyMatch[1]);
         return;
       }
 
