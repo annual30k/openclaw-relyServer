@@ -85,6 +85,12 @@ class InMemoryMetadataStore implements FileTransferMetadataStore {
     ));
   }
 
+  async listFilesForGatewayCleanup(gatewayId: string): Promise<FileTransferRecord[]> {
+    return Array.from(this.records.values()).filter((record) => (
+      record.gatewayId === gatewayId && record.status !== "deleted"
+    ));
+  }
+
   async listExpiredActiveFiles(now: Date): Promise<FileTransferRecord[]> {
     return Array.from(this.records.values()).filter((record) => (
       ["initiated", "uploading", "completed"].includes(record.status)
@@ -104,7 +110,10 @@ class InMemoryMetadataStore implements FileTransferMetadataStore {
     if (!record) {
       return false;
     }
-    record.status = "deleted";
+    this.records.delete(fileId);
+    if (record.uploadId) {
+      this.uploadIds.delete(record.uploadId);
+    }
     return true;
   }
 }

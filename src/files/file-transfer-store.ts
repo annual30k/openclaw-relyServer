@@ -182,6 +182,17 @@ export class FileTransferStore {
     return this.metadataStore.markDeleted(fileId);
   }
 
+  async deleteFilesForGateway(gatewayId: string): Promise<number> {
+    const records = await this.metadataStore.listFilesForGatewayCleanup(gatewayId.trim());
+    let deletedCount = 0;
+    for (const record of records) {
+      if (await this.deleteFile(record.fileId)) {
+        deletedCount += 1;
+      }
+    }
+    return deletedCount;
+  }
+
   async cleanupExpired(now = new Date()): Promise<void> {
     const expiredRecords = await this.metadataStore.listExpiredActiveFiles(now);
     for (const record of expiredRecords) {

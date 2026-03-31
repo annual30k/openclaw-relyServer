@@ -161,6 +161,20 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
     return rows.map(mapRow);
   }
 
+  async listFilesForGatewayCleanup(gatewayId: string): Promise<FileTransferRecord[]> {
+    const [rows] = await this.pool.query<FileTransferRow[]>(
+      `
+        SELECT *
+        FROM file_transfers
+        WHERE gateway_id = ?
+          AND status <> 'deleted'
+        ORDER BY created_at ASC
+      `,
+      [gatewayId],
+    );
+    return rows.map(mapRow);
+  }
+
   async listExpiredActiveFiles(now: Date): Promise<FileTransferRecord[]> {
     const [rows] = await this.pool.query<FileTransferRow[]>(
       `
@@ -182,11 +196,10 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
   async markDeleted(fileId: string): Promise<boolean> {
     const [result] = await this.pool.query(
       `
-        UPDATE file_transfers
-        SET status = 'deleted', updated_at = ?
-        WHERE file_id = ? AND status <> 'deleted'
+        DELETE FROM file_transfers
+        WHERE file_id = ?
       `,
-      [toSqlDate(new Date().toISOString()), fileId],
+      [fileId],
     );
     const affectedRows = "affectedRows" in result ? Number(result.affectedRows ?? 0) : 0;
     return affectedRows > 0;

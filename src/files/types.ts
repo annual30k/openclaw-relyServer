@@ -110,6 +110,7 @@ export interface FileTransferMetadataStore {
   touchUpload(uploadId: string): Promise<void>;
   completeUpload(input: CompleteUploadRecordInput): Promise<FileTransferRecord>;
   listVisibleCompletedFiles(gatewayId: string, sessionKey: string | undefined, viewerUserId: string): Promise<FileTransferRecord[]>;
+  listFilesForGatewayCleanup(gatewayId: string): Promise<FileTransferRecord[]>;
   listExpiredActiveFiles(now: Date): Promise<FileTransferRecord[]>;
   markExpired(fileId: string): Promise<void>;
   markDeleted(fileId: string): Promise<boolean>;

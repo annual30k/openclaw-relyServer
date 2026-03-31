@@ -176,6 +176,120 @@ function getMembership(gatewayIdValue: string, userId: string): GatewayMembershi
   );
 }
 
+function membershipsForUser(userId: string): GatewayMembershipRecord[] {
+  return store.snapshot().gatewayMemberships.filter((membership) => membership.userId === userId);
+}
+
+function extractSessionKeysFromPayload(payload: unknown): string[] {
+  const payloadRecord =
+    payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Record<string, unknown>)
+      : undefined;
+  const rawItems =
+    Array.isArray(payloadRecord?.sessions) ? payloadRecord.sessions
+      : Array.isArray(payloadRecord?.items) ? payloadRecord.items
+        : Array.isArray(payloadRecord?.list) ? payloadRecord.list
+          : Array.isArray(payload) ? payload
+            : [];
+
+  const deduped = new Set<string>(["main"]);
+  for (const entry of rawItems) {
+    if (typeof entry === "string" && entry.trim()) {
+      deduped.add(entry.trim());
+      continue;
+    }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue;
+    }
+    const record = entry as Record<string, unknown>;
+    const sessionKeyRaw =
+      typeof record.key === "string" ? record.key
+        : typeof record.sessionKey === "string" ? record.sessionKey
+          : typeof record.id === "string" ? record.id
+            : typeof record.session === "string" ? record.session
+              : undefined;
+    const sessionKey = sessionKeyRaw?.trim();
+    if (sessionKey) {
+      deduped.add(sessionKey);
+    }
+  }
+
+  return Array.from(deduped);
+}
+
+function isIgnorableSessionDeleteError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.trim().toLowerCase();
+  return (
+    normalized.includes("not_found") ||
+    normalized.includes("session not found") ||
+    normalized.includes("cannot delete the main session") ||
+    (normalized.includes("main session") && normalized.includes("cannot delete"))
+  );
+}
+
+function disconnectMobileSessionsForUser(userId: string, reason = "account_deleted"): void {
+  for (const [sessionKey, session] of mobileSessions.entries()) {
+    if (session.userId !== userId) {
+      continue;
+    }
+    session.socket.close(4001, reason);
+    mobileSessions.delete(sessionKey);
+  }
+  metrics.mobileConnections = mobileSessions.size;
+}
+
+function clearPendingStateForUser(userId: string): void {
+  for (const [id, pending] of pendingResponses.entries()) {
+    if (pending.userId === userId) {
+      failPending(id, "account_deleted", "Account deleted");
+    }
+  }
+
+  for (const [id, pending] of pendingHostCommands.entries()) {
+    if (pending.userId === userId) {
+      failPendingHostCommand(id, "account_deleted", "Account deleted");
+    }
+  }
+
+  for (const [sessionKey, pending] of pendingTaskRunsBySessionKey.entries()) {
+    if (pending.userId !== userId) {
+      continue;
+    }
+    clearTimeout(pending.timeout);
+    pendingTaskRunsBySessionKey.delete(sessionKey);
+    pendingTaskRunsByTaskID.delete(pending.taskId);
+  }
+}
+
+async function deleteGatewayChatDataForAccount(gatewayIdValue: string, userId: string): Promise<string[]> {
+  const warnings: string[] = [];
+
+  try {
+    const payload = await dispatchHostCommand(gatewayIdValue, userId, "sessions.list", {
+      limit: 1000,
+      includeGlobal: true,
+      includeUnknown: true,
+    });
+    for (const sessionKey of extractSessionKeysFromPayload(payload)) {
+      try {
+        await dispatchHostCommand(gatewayIdValue, userId, "sessions.delete", {
+          key: sessionKey,
+          deleteTranscript: true,
+        });
+      } catch (error) {
+        if (!isIgnorableSessionDeleteError(error)) {
+          warnings.push(`sessions.delete failed for ${sessionKey}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+  } catch (error) {
+    warnings.push(`sessions.list failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  return warnings;
+}
+
 function makeAccessToken(user: UserRecord, deviceId: string, platform: string, appVersion: string): string {
   return signToken(
     {
@@ -199,6 +313,10 @@ function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
+function userExists(userId: string): boolean {
+  return Boolean(store.snapshot().users[userId]);
+}
+
 function requireAuthenticatedUser(req: IncomingMessage, res: ServerResponse): string | null {
   const claims = requireAuthenticatedClaims(req, res);
   if (!claims) {
@@ -211,7 +329,13 @@ function requireAuthenticatedClaims(req: IncomingMessage, res: ServerResponse): 
   const auth = req.headers.authorization;
   if (auth?.startsWith("Bearer ")) {
     const claims = verifyToken<TokenClaims>(auth.slice("Bearer ".length), config.jwtSecret);
-    if (claims && claims.exp > nowIso() && typeof claims.userId === "string" && claims.userId) {
+    if (
+      claims &&
+      claims.exp > nowIso() &&
+      typeof claims.userId === "string" &&
+      claims.userId &&
+      userExists(claims.userId)
+    ) {
       return claims;
     }
   }
@@ -1504,7 +1628,12 @@ async function handleAuthLogin(req: IncomingMessage, res: ServerResponse): Promi
   const appVersion = typeof body.appVersion === "string" ? body.appVersion : "unknown";
   const user = findUserByEmail(email);
 
-  if (!user || !verifyPassword(password, user.passwordHash)) {
+  if (!user) {
+    json(res, 404, { error: "user_not_registered" });
+    return;
+  }
+
+  if (!verifyPassword(password, user.passwordHash)) {
     json(res, 401, { error: "invalid_credentials" });
     return;
   }
@@ -1524,6 +1653,51 @@ async function handleAuthLogin(req: IncomingMessage, res: ServerResponse): Promi
     user: { id: user.id, email: user.email, name: user.name },
     deviceId,
   });
+}
+
+async function handleAuthDeleteAccount(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const claims = requireAuthenticatedClaims(req, res);
+  if (!claims) return;
+
+  const memberships = membershipsForUser(claims.userId);
+  const cleanupWarnings: Array<{ gatewayId: string; step: string; error: string }> = [];
+
+  for (const membership of memberships) {
+    const chatWarnings = await deleteGatewayChatDataForAccount(membership.gatewayId, claims.userId);
+    for (const warning of chatWarnings) {
+      cleanupWarnings.push({
+        gatewayId: membership.gatewayId,
+        step: "chat",
+        error: warning,
+      });
+    }
+
+    try {
+      await fileStore.deleteFilesForGateway(membership.gatewayId);
+    } catch (error) {
+      cleanupWarnings.push({
+        gatewayId: membership.gatewayId,
+        step: "files",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  try {
+    clearPendingStateForUser(claims.userId);
+    disconnectMobileSessionsForUser(claims.userId);
+    await store.deleteUserAccount(claims.userId);
+
+    if (cleanupWarnings.length > 0) {
+      console.warn(
+        `[auth.delete-account] completed with cleanup warnings user=${claims.userId} warnings=${cleanupWarnings.length}`,
+      );
+    }
+    json(res, 200, { ok: true, cleanupWarnings });
+  } catch (error) {
+    console.error(`[auth.delete-account] failed user=${claims.userId}`, error);
+    json(res, 500, { error: "internal_error" });
+  }
 }
 
 async function handleMobilePair(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1662,11 +1836,20 @@ async function handleGatewayDelete(req: IncomingMessage, res: ServerResponse, ga
   const userId = requireAuthenticatedUser(req, res);
   if (!userId) return;
   const membership = getMembership(gatewayIdValue, userId);
+  const gateway = store.snapshot().gateways[gatewayIdValue];
   if (!membership) {
     json(res, 404, { error: "gateway_not_found" });
     return;
   }
   store.removeMembership(gatewayIdValue, userId);
+  if (gateway) {
+    const nextOwner = store.snapshot().gatewayMemberships.find(
+      (candidate) => candidate.gatewayId === gatewayIdValue && candidate.role === "owner",
+    );
+    gateway.ownerUserId = nextOwner?.userId;
+    gateway.updatedAt = nowIso();
+    store.putGateway(gateway);
+  }
   const runtime = normalizeGatewayRuntime(gatewayIdValue);
   if (runtime.controllerUserId === userId) {
     runtime.controllerUserId = undefined;
@@ -3060,6 +3243,11 @@ const server = createServer((req, res) => {
         return;
       }
 
+      if (req.method === "DELETE" && requestUrl.pathname === "/api/auth/account") {
+        await handleAuthDeleteAccount(req, res);
+        return;
+      }
+
       if (
         req.method === "POST" &&
         (requestUrl.pathname === "/api/relay/access-code" || requestUrl.pathname === "/api/relay/accesscode")
@@ -3524,7 +3712,15 @@ mobileWsServer.on("connection", async (socket, req) => {
   const accessToken = requestUrl.searchParams.get("accessToken") ?? "";
   const claims = verifyToken<TokenClaims>(accessToken, config.jwtSecret);
 
-  if (!claims || claims.exp <= nowIso() || typeof claims.deviceId !== "string" || !claims.deviceId) {
+  if (
+    !claims ||
+    claims.exp <= nowIso() ||
+    typeof claims.deviceId !== "string" ||
+    !claims.deviceId ||
+    typeof claims.userId !== "string" ||
+    !claims.userId ||
+    !userExists(claims.userId)
+  ) {
     socket.close(4401, "unauthorized");
     return;
   }

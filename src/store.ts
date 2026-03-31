@@ -229,6 +229,45 @@ export class RelayStore {
     return store;
   }
 
+  async deleteUserAccount(userId: string): Promise<void> {
+    const conn = await this.pool.getConnection();
+    let shouldDestroyConnection = false;
+    try {
+      await conn.ping();
+      await conn.beginTransaction();
+      await conn.query(
+        `
+          DELETE FROM relay_sessions
+          WHERE user_id = ?
+             OR device_id IN (
+               SELECT id
+               FROM mobile_devices
+               WHERE user_id = ?
+             )
+        `,
+        [userId, userId],
+      );
+      await conn.query("DELETE FROM users WHERE id = ?", [userId]);
+      await conn.commit();
+    } catch (error) {
+      shouldDestroyConnection = isClosedConnectionError(error);
+      try {
+        await conn.rollback();
+      } catch (rollbackError) {
+        if (!isClosedConnectionError(rollbackError)) {
+          console.error("[relay-store] rollback failed", rollbackError);
+        }
+      }
+      throw error;
+    } finally {
+      if (shouldDestroyConnection) {
+        (conn as { destroy?: () => void }).destroy?.();
+      }
+      conn.release();
+    }
+    await this.load();
+  }
+
   private async ensureSchema(): Promise<void> {
     const schemaPath = join(__dirname, "..", "mysql", "init", "001_schema.sql");
     const schemaSql = readFileSync(schemaPath, "utf8");
