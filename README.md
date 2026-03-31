@@ -10,9 +10,9 @@ MVP relay server that implements the development contract in `docs/relay-develop
 - Command routing, event fan-out, and response relay
 - Skills status lookup and write-back to the host gateway
 - Presence aggregation, sensitive-action approval, and audit logging
-- File-backed persistence for local development
+- MySQL-backed relay state and file transfer metadata
+- Pluggable file transfer storage with local disk or MinIO object storage
 - Docker and Docker Compose support
-- MySQL 5.7 service and schema bootstrap for deployment
 
 ## Run
 
@@ -20,6 +20,8 @@ MVP relay server that implements the development contract in `docs/relay-develop
 npm install
 npm run dev
 ```
+
+File transfer defaults to local disk unless `FILE_STORAGE_DRIVER=minio` is configured.
 
 ## Docker Compose
 
@@ -30,7 +32,10 @@ docker compose up -d --build
 `docker-compose.yml` now starts:
 
 - `relay-api`
-- `mysql:5.7`
+- `mysql:8.4.8`
+- `minio`
+
+If you are switching a test environment from MySQL 5.7 to 8.4, rebuild the MySQL container with a fresh database volume instead of reusing the old 5.7 data directory.
 
 MySQL init SQL lives in `mysql/init/001_schema.sql` and automatically creates the database and these tables:
 
@@ -43,8 +48,24 @@ MySQL init SQL lives in `mysql/init/001_schema.sql` and automatically creates th
 - `gateway_runtime_state`
 - `command_audit_logs`
 - `api_tokens`
+- `approvals`
+- `file_transfers`
 
-Current status: the application persistence layer uses MySQL 5.7 through `DATABASE_URL`. `DATA_DIR` remains only as an optional local artifact directory.
+`DATA_DIR` is still required for temporary chunk staging. Completed file bodies are stored either on local disk or in MinIO, while metadata lives in MySQL.
+
+## Storage Configuration
+
+- `FILE_STORAGE_DRIVER=disk|minio`
+- `FILE_CHUNK_SIZE_BYTES`
+- `FILE_UPLOAD_TTL_SECONDS`
+- `FILE_TTL_SECONDS`
+- `MINIO_ENDPOINT`
+- `MINIO_PORT`
+- `MINIO_USE_SSL`
+- `MINIO_ACCESS_KEY`
+- `MINIO_SECRET_KEY`
+- `MINIO_BUCKET`
+- `MINIO_REGION`
 
 ## Endpoints
 
@@ -58,6 +79,13 @@ Current status: the application persistence layer uses MySQL 5.7 through `DATABA
 - `GET /api/mobile/gateways/:gatewayId/skills`
 - `PATCH /api/mobile/gateways/:gatewayId/skills/:skillKey`
 - `POST /api/mobile/gateways/:gatewayId/approve-sensitive-action`
+- `POST /api/host/gateways/:gatewayId/files/init`
+- `PUT /api/host/files/:uploadId/chunks/:index`
+- `POST /api/host/files/:uploadId/complete`
+- `POST /api/mobile/gateways/:gatewayId/files/init`
+- `PUT /api/mobile/files/:uploadId/chunks/:index`
+- `POST /api/mobile/files/:uploadId/complete`
+- `GET /api/mobile/files/:fileId`
 - `GET /healthz`
 - `GET /metrics`
 

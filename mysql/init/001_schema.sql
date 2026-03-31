@@ -215,3 +215,45 @@ CREATE TABLE IF NOT EXISTS approvals (
     FOREIGN KEY (user_id) REFERENCES users (id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS file_transfers (
+  file_id VARCHAR(64) NOT NULL,
+  upload_id VARCHAR(64) DEFAULT NULL,
+  gateway_id VARCHAR(64) NOT NULL,
+  session_key VARCHAR(128) NOT NULL,
+  origin VARCHAR(16) NOT NULL,
+  uploader_user_id VARCHAR(64) DEFAULT NULL,
+  uploader_device_id VARCHAR(64) DEFAULT NULL,
+  sender_display_name VARCHAR(191) DEFAULT NULL,
+  file_name VARCHAR(255) NOT NULL,
+  mime_type VARCHAR(255) NOT NULL,
+  size_bytes BIGINT UNSIGNED NOT NULL,
+  sha256 CHAR(64) NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  storage_backend VARCHAR(16) NOT NULL DEFAULT 'disk',
+  storage_bucket VARCHAR(191) DEFAULT NULL,
+  storage_key VARCHAR(512) DEFAULT NULL,
+  storage_path VARCHAR(1024) DEFAULT NULL,
+  download_path VARCHAR(255) NOT NULL,
+  chunk_size INT UNSIGNED NOT NULL DEFAULT 0,
+  total_chunks INT UNSIGNED NOT NULL DEFAULT 0,
+  expires_at DATETIME NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (file_id),
+  UNIQUE KEY uk_file_transfers_upload_id (upload_id),
+  KEY idx_file_transfers_gateway_session (gateway_id, session_key),
+  KEY idx_file_transfers_gateway_status_created_at (gateway_id, status, created_at),
+  KEY idx_file_transfers_gateway_session_status_created_at (gateway_id, session_key, status, created_at),
+  KEY idx_file_transfers_uploader_user_id (uploader_user_id),
+  KEY idx_file_transfers_status_expires_at (status, expires_at),
+  CONSTRAINT fk_file_transfers_gateway
+    FOREIGN KEY (gateway_id) REFERENCES gateways (id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_file_transfers_uploader_user
+    FOREIGN KEY (uploader_user_id) REFERENCES users (id)
+    ON DELETE SET NULL,
+  CONSTRAINT fk_file_transfers_uploader_device
+    FOREIGN KEY (uploader_device_id) REFERENCES mobile_devices (id)
+    ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

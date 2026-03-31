@@ -29,6 +29,7 @@ const EMPTY_STATE: RelayState = {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+const KEY_SEPARATOR = "\u0000";
 
 function toSqlDate(value?: string): string | null {
   if (!value) return null;
@@ -139,9 +140,84 @@ type TaskRow = RowDataPacket & {
   updated_at: string;
 };
 
+type PendingChanges = {
+  users: Set<string>;
+  mobileDevices: Set<string>;
+  gateways: Set<string>;
+  pairingCodes: Set<string>;
+  deletedPairingCodes: Set<string>;
+  runtimeStates: Set<string>;
+  memberships: Set<string>;
+  deletedMemberships: Set<string>;
+  approvals: Set<string>;
+  deletedApprovals: Set<string>;
+  tasks: Set<string>;
+  deletedTasks: Set<string>;
+  auditLogs: CommandAuditLogRecord[];
+  trimAuditLogs: boolean;
+};
+
+function createPendingChanges(): PendingChanges {
+  return {
+    users: new Set(),
+    mobileDevices: new Set(),
+    gateways: new Set(),
+    pairingCodes: new Set(),
+    deletedPairingCodes: new Set(),
+    runtimeStates: new Set(),
+    memberships: new Set(),
+    deletedMemberships: new Set(),
+    approvals: new Set(),
+    deletedApprovals: new Set(),
+    tasks: new Set(),
+    deletedTasks: new Set(),
+    auditLogs: [],
+    trimAuditLogs: false,
+  };
+}
+
+function membershipKey(gatewayId: string, userId: string): string {
+  return `${gatewayId}${KEY_SEPARATOR}${userId}`;
+}
+
+function parseMembershipKey(value: string): [string, string] {
+  const separatorIndex = value.indexOf(KEY_SEPARATOR);
+  if (separatorIndex < 0) return [value, ""];
+  return [value.slice(0, separatorIndex), value.slice(separatorIndex + 1)];
+}
+
+function approvalKey(gatewayId: string, userId: string, method: string): string {
+  return `${gatewayId}${KEY_SEPARATOR}${userId}${KEY_SEPARATOR}${method}`;
+}
+
+function parseApprovalKey(value: string): [string, string, string] {
+  const parts = value.split(KEY_SEPARATOR);
+  return [parts[0] ?? "", parts[1] ?? "", parts.slice(2).join(KEY_SEPARATOR)];
+}
+
+function hasPendingChanges(pending: PendingChanges): boolean {
+  return (
+    pending.users.size > 0 ||
+    pending.mobileDevices.size > 0 ||
+    pending.gateways.size > 0 ||
+    pending.pairingCodes.size > 0 ||
+    pending.deletedPairingCodes.size > 0 ||
+    pending.runtimeStates.size > 0 ||
+    pending.memberships.size > 0 ||
+    pending.deletedMemberships.size > 0 ||
+    pending.approvals.size > 0 ||
+    pending.deletedApprovals.size > 0 ||
+    pending.tasks.size > 0 ||
+    pending.deletedTasks.size > 0 ||
+    pending.auditLogs.length > 0 ||
+    pending.trimAuditLogs
+  );
+}
+
 export class RelayStore {
   private state: RelayState = structuredClone(EMPTY_STATE);
   private saveQueue: Promise<void> = Promise.resolve();
+  private pendingChanges: PendingChanges = createPendingChanges();
 
   private constructor(private readonly pool: Pool) {}
 
@@ -185,6 +261,20 @@ export class RelayStore {
     const runtimeColumnSet = new Set(runtimeColumns.map((row) => String(row.COLUMN_NAME)));
     if (!runtimeColumnSet.has("context_limit")) {
       await this.pool.query("ALTER TABLE gateway_runtime_state ADD COLUMN context_limit INT DEFAULT NULL AFTER context_usage");
+    }
+    const [fileTransferIndexes] = await this.pool.query<RowDataPacket[]>(
+      "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'file_transfers'",
+    );
+    const fileTransferIndexSet = new Set(fileTransferIndexes.map((row) => String(row.INDEX_NAME)));
+    if (!fileTransferIndexSet.has("idx_file_transfers_gateway_status_created_at")) {
+      await this.pool.query(
+        "ALTER TABLE file_transfers ADD INDEX idx_file_transfers_gateway_status_created_at (gateway_id, status, created_at)",
+      );
+    }
+    if (!fileTransferIndexSet.has("idx_file_transfers_gateway_session_status_created_at")) {
+      await this.pool.query(
+        "ALTER TABLE file_transfers ADD INDEX idx_file_transfers_gateway_session_status_created_at (gateway_id, session_key, status, created_at)",
+      );
     }
     await this.pool.query(`
       UPDATE users
@@ -334,10 +424,17 @@ export class RelayStore {
         updatedAt: toIso(row.updated_at) ?? new Date().toISOString(),
       };
     }
+
+    this.pendingChanges = createPendingChanges();
   }
 
   async save(): Promise<void> {
     this.saveQueue = this.saveQueue.catch(() => undefined).then(async () => {
+      const pending = this.takePendingChanges();
+      if (!hasPendingChanges(pending)) {
+        return;
+      }
+
       const maxAttempts = 2;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         const conn = await this.pool.getConnection();
@@ -348,26 +445,20 @@ export class RelayStore {
           await conn.ping();
           await conn.beginTransaction();
 
-          await conn.query("DELETE FROM approvals");
-          await conn.query("DELETE FROM gateway_tasks");
-          await conn.query("DELETE FROM command_audit_logs");
-          await conn.query("DELETE FROM gateway_runtime_state");
-          await conn.query("DELETE FROM gateway_memberships");
-          await conn.query("DELETE FROM gateway_pairing_codes");
-          await conn.query("DELETE FROM mobile_devices");
-          await conn.query("DELETE FROM gateways");
-          await conn.query("DELETE FROM users");
-
-          for (const user of Object.values(this.state.users)) {
+          for (const userId of pending.users) {
+            const user = this.state.users[userId];
+            if (!user) continue;
             await conn.query(
-              "INSERT INTO users (id, email, password_hash, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE email = VALUES(email), password_hash = VALUES(password_hash), name = VALUES(name), updated_at = VALUES(updated_at)",
+              "INSERT INTO users (id, email, password_hash, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) AS new_user ON DUPLICATE KEY UPDATE email = new_user.email, password_hash = new_user.password_hash, name = new_user.name, updated_at = new_user.updated_at",
               [user.id, user.email, user.passwordHash, user.name, toSqlDate(user.createdAt), toSqlDate(new Date().toISOString())],
             );
           }
 
-          for (const gateway of Object.values(this.state.gateways)) {
+          for (const gatewayId of pending.gateways) {
+            const gateway = this.state.gateways[gatewayId];
+            if (!gateway) continue;
             await conn.query(
-              "INSERT INTO gateways (id, owner_user_id, gateway_code, relay_secret_hash, display_name, platform, agent_version, openclaw_version, status, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO gateways (id, owner_user_id, gateway_code, relay_secret_hash, display_name, platform, agent_version, openclaw_version, status, last_seen_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) AS new_gateway ON DUPLICATE KEY UPDATE owner_user_id = new_gateway.owner_user_id, gateway_code = new_gateway.gateway_code, relay_secret_hash = new_gateway.relay_secret_hash, display_name = new_gateway.display_name, platform = new_gateway.platform, agent_version = new_gateway.agent_version, openclaw_version = new_gateway.openclaw_version, status = new_gateway.status, last_seen_at = new_gateway.last_seen_at, created_at = new_gateway.created_at, updated_at = new_gateway.updated_at",
               [
                 gateway.id,
                 gateway.ownerUserId ?? null,
@@ -385,9 +476,11 @@ export class RelayStore {
             );
           }
 
-          for (const device of Object.values(this.state.mobileDevices)) {
+          for (const deviceId of pending.mobileDevices) {
+            const device = this.state.mobileDevices[deviceId];
+            if (!device) continue;
             await conn.query(
-              "INSERT INTO mobile_devices (id, user_id, platform, app_version, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)",
+              "INSERT INTO mobile_devices (id, user_id, platform, app_version, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?) AS new_device ON DUPLICATE KEY UPDATE user_id = new_device.user_id, platform = new_device.platform, app_version = new_device.app_version, created_at = new_device.created_at, last_seen_at = new_device.last_seen_at",
               [
                 device.id,
                 device.userId,
@@ -399,9 +492,11 @@ export class RelayStore {
             );
           }
 
-          for (const code of Object.values(this.state.gatewayPairingCodes)) {
+          for (const gatewayId of pending.pairingCodes) {
+            const code = this.state.gatewayPairingCodes[gatewayId];
+            if (!code) continue;
             await conn.query(
-              "INSERT INTO gateway_pairing_codes (gateway_id, access_code_hash, expires_at, used_at, created_at) VALUES (?, ?, ?, ?, ?)",
+              "INSERT INTO gateway_pairing_codes (gateway_id, access_code_hash, expires_at, used_at, created_at) VALUES (?, ?, ?, ?, ?) AS new_code ON DUPLICATE KEY UPDATE access_code_hash = new_code.access_code_hash, expires_at = new_code.expires_at, used_at = new_code.used_at, created_at = new_code.created_at",
               [
                 code.gatewayId,
                 code.accessCodeHash,
@@ -412,9 +507,14 @@ export class RelayStore {
             );
           }
 
-          for (const membership of this.state.gatewayMemberships) {
+          for (const key of pending.memberships) {
+            const [gatewayId, userId] = parseMembershipKey(key);
+            const membership = this.state.gatewayMemberships.find(
+              (candidate) => candidate.gatewayId === gatewayId && candidate.userId === userId,
+            );
+            if (!membership) continue;
             await conn.query(
-              "INSERT INTO gateway_memberships (gateway_id, user_id, role, created_at) VALUES (?, ?, ?, ?)",
+              "INSERT INTO gateway_memberships (gateway_id, user_id, role, created_at) VALUES (?, ?, ?, ?) AS new_membership ON DUPLICATE KEY UPDATE role = new_membership.role, created_at = new_membership.created_at",
               [
                 membership.gatewayId,
                 membership.userId,
@@ -424,9 +524,11 @@ export class RelayStore {
             );
           }
 
-          for (const runtime of Object.values(this.state.gatewayRuntimeState)) {
+          for (const gatewayId of pending.runtimeStates) {
+            const runtime = this.state.gatewayRuntimeState[gatewayId];
+            if (!runtime) continue;
             await conn.query(
-              "INSERT INTO gateway_runtime_state (gateway_id, relay_status, host_status, openclaw_status, aggregate_status, current_model, context_usage, context_limit, controller_user_id, controller_device_id, mobile_control_status, last_seen_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO gateway_runtime_state (gateway_id, relay_status, host_status, openclaw_status, aggregate_status, current_model, context_usage, context_limit, controller_user_id, controller_device_id, mobile_control_status, last_seen_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) AS new_runtime ON DUPLICATE KEY UPDATE relay_status = new_runtime.relay_status, host_status = new_runtime.host_status, openclaw_status = new_runtime.openclaw_status, aggregate_status = new_runtime.aggregate_status, current_model = new_runtime.current_model, context_usage = new_runtime.context_usage, context_limit = new_runtime.context_limit, controller_user_id = new_runtime.controller_user_id, controller_device_id = new_runtime.controller_device_id, mobile_control_status = new_runtime.mobile_control_status, last_seen_at = new_runtime.last_seen_at, updated_at = new_runtime.updated_at",
               [
                 runtime.gatewayId,
                 runtime.relayStatus,
@@ -445,7 +547,7 @@ export class RelayStore {
             );
           }
 
-          for (const log of this.state.commandAuditLogs.slice(0, 5000)) {
+          for (const log of pending.auditLogs) {
             await conn.query(
               "INSERT INTO command_audit_logs (gateway_id, user_id, method, risk_level, params_masked, result_ok, error_code, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
               [
@@ -461,10 +563,32 @@ export class RelayStore {
               ],
             );
           }
+          if (pending.trimAuditLogs) {
+            await conn.query(`
+              DELETE FROM command_audit_logs
+              WHERE id NOT IN (
+                SELECT id
+                FROM (
+                  SELECT id
+                  FROM command_audit_logs
+                  ORDER BY id DESC
+                  LIMIT 5000
+                ) AS recent_logs
+              )
+            `);
+          }
 
-          for (const approval of this.state.approvals) {
+          for (const key of pending.approvals) {
+            const [gatewayId, userId, method] = parseApprovalKey(key);
+            const approval = this.state.approvals.find(
+              (candidate) =>
+                candidate.gatewayId === gatewayId &&
+                candidate.userId === userId &&
+                candidate.method === method,
+            );
+            if (!approval) continue;
             await conn.query(
-              "INSERT INTO approvals (gateway_id, user_id, method, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+              "INSERT INTO approvals (gateway_id, user_id, method, expires_at, created_at) VALUES (?, ?, ?, ?, ?) AS new_approval ON DUPLICATE KEY UPDATE expires_at = new_approval.expires_at, created_at = new_approval.created_at",
               [
                 approval.gatewayId,
                 approval.userId,
@@ -475,9 +599,11 @@ export class RelayStore {
             );
           }
 
-          for (const task of Object.values(this.state.tasks)) {
+          for (const taskId of pending.tasks) {
+            const task = this.state.tasks[taskId];
+            if (!task) continue;
             await conn.query(
-              "INSERT INTO gateway_tasks (id, gateway_id, user_id, title, prompt, schedule_kind, schedule_at, repeat_amount, repeat_unit, enabled, last_result, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO gateway_tasks (id, gateway_id, user_id, title, prompt, schedule_kind, schedule_at, repeat_amount, repeat_unit, enabled, last_result, next_run_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) AS new_task ON DUPLICATE KEY UPDATE gateway_id = new_task.gateway_id, user_id = new_task.user_id, title = new_task.title, prompt = new_task.prompt, schedule_kind = new_task.schedule_kind, schedule_at = new_task.schedule_at, repeat_amount = new_task.repeat_amount, repeat_unit = new_task.repeat_unit, enabled = new_task.enabled, last_result = new_task.last_result, next_run_at = new_task.next_run_at, created_at = new_task.created_at, updated_at = new_task.updated_at",
               [
                 task.id,
                 task.gatewayId,
@@ -497,6 +623,24 @@ export class RelayStore {
             );
           }
 
+          for (const gatewayId of pending.deletedPairingCodes) {
+            await conn.query("DELETE FROM gateway_pairing_codes WHERE gateway_id = ?", [gatewayId]);
+          }
+
+          for (const key of pending.deletedMemberships) {
+            const [gatewayId, userId] = parseMembershipKey(key);
+            await conn.query("DELETE FROM gateway_memberships WHERE gateway_id = ? AND user_id = ?", [gatewayId, userId]);
+          }
+
+          for (const key of pending.deletedApprovals) {
+            const [gatewayId, userId, method] = parseApprovalKey(key);
+            await conn.query("DELETE FROM approvals WHERE gateway_id = ? AND user_id = ? AND method = ?", [gatewayId, userId, method]);
+          }
+
+          for (const taskId of pending.deletedTasks) {
+            await conn.query("DELETE FROM gateway_tasks WHERE id = ?", [taskId]);
+          }
+
           await conn.commit();
           return;
         } catch (error) {
@@ -509,6 +653,7 @@ export class RelayStore {
             }
           }
           if (!shouldDestroyConnection || attempt >= maxAttempts) {
+            this.restorePendingChanges(pending);
             throw error;
           }
           console.warn(`[relay-store] retrying save after stale MySQL connection (attempt ${attempt}/${maxAttempts})`);
@@ -529,22 +674,28 @@ export class RelayStore {
 
   putUser(user: UserRecord): void {
     this.state.users[user.id] = user;
+    this.pendingChanges.users.add(user.id);
   }
 
   putMobileDevice(device: MobileDeviceRecord): void {
     this.state.mobileDevices[device.id] = device;
+    this.pendingChanges.mobileDevices.add(device.id);
   }
 
   putGateway(gateway: GatewayRecord): void {
     this.state.gateways[gateway.id] = gateway;
+    this.pendingChanges.gateways.add(gateway.id);
   }
 
   putPairingCode(record: GatewayPairingCodeRecord): void {
     this.state.gatewayPairingCodes[record.gatewayId] = record;
+    this.pendingChanges.pairingCodes.add(record.gatewayId);
+    this.pendingChanges.deletedPairingCodes.delete(record.gatewayId);
   }
 
   putRuntimeState(runtime: GatewayRuntimeStateRecord): void {
     this.state.gatewayRuntimeState[runtime.gatewayId] = runtime;
+    this.pendingChanges.runtimeStates.add(runtime.gatewayId);
   }
 
   putMembership(record: GatewayMembershipRecord): void {
@@ -553,20 +704,30 @@ export class RelayStore {
     );
     if (existing) {
       existing.role = record.role;
+      existing.createdAt = record.createdAt;
+      this.pendingChanges.memberships.add(membershipKey(record.gatewayId, record.userId));
+      this.pendingChanges.deletedMemberships.delete(membershipKey(record.gatewayId, record.userId));
       return;
     }
     this.state.gatewayMemberships.push(record);
+    this.pendingChanges.memberships.add(membershipKey(record.gatewayId, record.userId));
+    this.pendingChanges.deletedMemberships.delete(membershipKey(record.gatewayId, record.userId));
   }
 
   removeMembership(gatewayId: string, userId: string): void {
     this.state.gatewayMemberships = this.state.gatewayMemberships.filter(
       (membership) => !(membership.gatewayId === gatewayId && membership.userId === userId),
     );
+    const key = membershipKey(gatewayId, userId);
+    this.pendingChanges.memberships.delete(key);
+    this.pendingChanges.deletedMemberships.add(key);
   }
 
   addAuditLog(log: CommandAuditLogRecord): void {
     this.state.commandAuditLogs.unshift(log);
     this.state.commandAuditLogs = this.state.commandAuditLogs.slice(0, 5000);
+    this.pendingChanges.auditLogs.push(log);
+    this.pendingChanges.trimAuditLogs = true;
   }
 
   addApproval(approval: ApprovalRecord): void {
@@ -579,14 +740,21 @@ export class RelayStore {
         ),
     );
     this.state.approvals.push(approval);
+    const key = approvalKey(approval.gatewayId, approval.userId, approval.method);
+    this.pendingChanges.approvals.add(key);
+    this.pendingChanges.deletedApprovals.delete(key);
   }
 
   putTask(task: TaskRecord): void {
     this.state.tasks[task.id] = task;
+    this.pendingChanges.tasks.add(task.id);
+    this.pendingChanges.deletedTasks.delete(task.id);
   }
 
   removeTask(taskId: string): void {
     delete this.state.tasks[taskId];
+    this.pendingChanges.tasks.delete(taskId);
+    this.pendingChanges.deletedTasks.add(taskId);
   }
 
   tasksForGateway(gatewayId: string): TaskRecord[] {
@@ -602,7 +770,10 @@ export class RelayStore {
         approval.expiresAt > now,
     );
     if (index < 0) return false;
-    this.state.approvals.splice(index, 1);
+    const [approval] = this.state.approvals.splice(index, 1);
+    const key = approvalKey(approval.gatewayId, approval.userId, approval.method);
+    this.pendingChanges.approvals.delete(key);
+    this.pendingChanges.deletedApprovals.add(key);
     return true;
   }
 
@@ -610,8 +781,100 @@ export class RelayStore {
     for (const [gatewayId, code] of Object.entries(this.state.gatewayPairingCodes)) {
       if (code.expiresAt <= now || code.usedAt) {
         delete this.state.gatewayPairingCodes[gatewayId];
+        this.pendingChanges.pairingCodes.delete(gatewayId);
+        this.pendingChanges.deletedPairingCodes.add(gatewayId);
       }
     }
-    this.state.approvals = this.state.approvals.filter((approval) => approval.expiresAt > now);
+    const remainingApprovals: ApprovalRecord[] = [];
+    for (const approval of this.state.approvals) {
+      if (approval.expiresAt > now) {
+        remainingApprovals.push(approval);
+        continue;
+      }
+      const key = approvalKey(approval.gatewayId, approval.userId, approval.method);
+      this.pendingChanges.approvals.delete(key);
+      this.pendingChanges.deletedApprovals.add(key);
+    }
+    this.state.approvals = remainingApprovals;
+  }
+
+  private takePendingChanges(): PendingChanges {
+    const current = this.pendingChanges;
+    this.pendingChanges = createPendingChanges();
+    return current;
+  }
+
+  private restorePendingChanges(pending: PendingChanges): void {
+    for (const value of pending.users) this.pendingChanges.users.add(value);
+    for (const value of pending.mobileDevices) this.pendingChanges.mobileDevices.add(value);
+    for (const value of pending.gateways) this.pendingChanges.gateways.add(value);
+    for (const value of pending.pairingCodes) this.pendingChanges.pairingCodes.add(value);
+    for (const value of pending.deletedPairingCodes) this.pendingChanges.deletedPairingCodes.add(value);
+    for (const value of pending.runtimeStates) this.pendingChanges.runtimeStates.add(value);
+    for (const value of pending.memberships) this.pendingChanges.memberships.add(value);
+    for (const value of pending.deletedMemberships) this.pendingChanges.deletedMemberships.add(value);
+    for (const value of pending.approvals) this.pendingChanges.approvals.add(value);
+    for (const value of pending.deletedApprovals) this.pendingChanges.deletedApprovals.add(value);
+    for (const value of pending.tasks) this.pendingChanges.tasks.add(value);
+    for (const value of pending.deletedTasks) this.pendingChanges.deletedTasks.add(value);
+    this.pendingChanges.auditLogs = [...pending.auditLogs, ...this.pendingChanges.auditLogs];
+    this.pendingChanges.trimAuditLogs = this.pendingChanges.trimAuditLogs || pending.trimAuditLogs;
+
+    for (const gatewayId of Array.from(this.pendingChanges.pairingCodes)) {
+      if (!this.state.gatewayPairingCodes[gatewayId]) {
+        this.pendingChanges.pairingCodes.delete(gatewayId);
+      }
+    }
+    for (const gatewayId of Array.from(this.pendingChanges.deletedPairingCodes)) {
+      if (this.state.gatewayPairingCodes[gatewayId]) {
+        this.pendingChanges.deletedPairingCodes.delete(gatewayId);
+      }
+    }
+    for (const key of Array.from(this.pendingChanges.memberships)) {
+      const [gatewayId, userId] = parseMembershipKey(key);
+      const exists = this.state.gatewayMemberships.some(
+        (membership) => membership.gatewayId === gatewayId && membership.userId === userId,
+      );
+      if (!exists) {
+        this.pendingChanges.memberships.delete(key);
+      }
+    }
+    for (const key of Array.from(this.pendingChanges.deletedMemberships)) {
+      const [gatewayId, userId] = parseMembershipKey(key);
+      const exists = this.state.gatewayMemberships.some(
+        (membership) => membership.gatewayId === gatewayId && membership.userId === userId,
+      );
+      if (exists) {
+        this.pendingChanges.deletedMemberships.delete(key);
+      }
+    }
+    for (const key of Array.from(this.pendingChanges.approvals)) {
+      const [gatewayId, userId, method] = parseApprovalKey(key);
+      const exists = this.state.approvals.some(
+        (approval) => approval.gatewayId === gatewayId && approval.userId === userId && approval.method === method,
+      );
+      if (!exists) {
+        this.pendingChanges.approvals.delete(key);
+      }
+    }
+    for (const key of Array.from(this.pendingChanges.deletedApprovals)) {
+      const [gatewayId, userId, method] = parseApprovalKey(key);
+      const exists = this.state.approvals.some(
+        (approval) => approval.gatewayId === gatewayId && approval.userId === userId && approval.method === method,
+      );
+      if (exists) {
+        this.pendingChanges.deletedApprovals.delete(key);
+      }
+    }
+    for (const taskId of Array.from(this.pendingChanges.tasks)) {
+      if (!this.state.tasks[taskId]) {
+        this.pendingChanges.tasks.delete(taskId);
+      }
+    }
+    for (const taskId of Array.from(this.pendingChanges.deletedTasks)) {
+      if (this.state.tasks[taskId]) {
+        this.pendingChanges.deletedTasks.delete(taskId);
+      }
+    }
   }
 }

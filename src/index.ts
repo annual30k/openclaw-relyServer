@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { randomUUID } from "crypto";
+import { pipeline } from "stream/promises";
 import { WebSocket, WebSocketServer } from "ws";
 import { loadConfig } from "./config.js";
+import { canAccessFileTransfer, FileTransferRecord, FileTransferStore } from "./files/file-transfer-store.js";
 import { addSeconds, gatewayCode, gatewayId, hashPassword, maskSensitive, nowIso, randomCode, randomSecret, safeJsonParse, sha256, signToken, verifyPassword, verifyToken } from "./security.js";
 import { classifyRisk, isReadOnly, requiresApproval } from "./risk.js";
 import { RelayStore } from "./store.js";
@@ -20,6 +22,15 @@ import type {
 
 const config = loadConfig();
 const store = await RelayStore.create(config.databaseUrl);
+const fileStore = await FileTransferStore.create({
+  dataDir: config.dataDir,
+  databaseUrl: config.databaseUrl,
+  chunkSizeBytes: config.fileChunkSizeBytes,
+  uploadTtlMs: config.fileUploadTtlSeconds * 1000,
+  fileTtlMs: config.fileTtlSeconds * 1000,
+  storageBackend: config.fileStorageDriver,
+  minio: config.minio,
+});
 
 type Metrics = {
   hostConnections: number;
@@ -100,6 +111,7 @@ const rateLimitBuckets = new Map<string, number[]>();
 const pendingTaskRunsBySessionKey = new Map<string, PendingTaskRun>();
 const pendingTaskRunsByTaskID = new Map<string, PendingTaskRun>();
 const taskRunTimeoutMs = 30 * 60 * 1000;
+let fileCleanupInFlight = false;
 
 const hostWsServer = new WebSocketServer({ noServer: true });
 const mobileWsServer = new WebSocketServer({ noServer: true });
@@ -164,25 +176,6 @@ function getMembership(gatewayIdValue: string, userId: string): GatewayMembershi
   );
 }
 
-function getUserIdFromRequest(req: IncomingMessage): string | null {
-  const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ")) {
-    const claims = verifyToken<TokenClaims>(auth.slice("Bearer ".length), config.jwtSecret);
-    if (claims && claims.exp > nowIso() && typeof claims.userId === "string" && claims.userId) {
-      return claims.userId;
-    }
-  }
-  return null;
-}
-
-function ensureUser(userId: string): UserRecord {
-  const existing = store.snapshot().users[userId];
-  if (existing) return existing;
-  const user: UserRecord = { id: userId, email: `${userId}@local.invalid`, passwordHash: "", name: userId, createdAt: nowIso() };
-  store.putUser(user);
-  return user;
-}
-
 function makeAccessToken(user: UserRecord, deviceId: string, platform: string, appVersion: string): string {
   return signToken(
     {
@@ -207,12 +200,37 @@ function normalizeEmail(email: string): string {
 }
 
 function requireAuthenticatedUser(req: IncomingMessage, res: ServerResponse): string | null {
-  const userId = getUserIdFromRequest(req);
-  if (!userId) {
-    json(res, 401, { error: "unauthorized" });
+  const claims = requireAuthenticatedClaims(req, res);
+  if (!claims) {
     return null;
   }
-  return userId;
+  return claims.userId;
+}
+
+function requireAuthenticatedClaims(req: IncomingMessage, res: ServerResponse): TokenClaims | null {
+  const auth = req.headers.authorization;
+  if (auth?.startsWith("Bearer ")) {
+    const claims = verifyToken<TokenClaims>(auth.slice("Bearer ".length), config.jwtSecret);
+    if (claims && claims.exp > nowIso() && typeof claims.userId === "string" && claims.userId) {
+      return claims;
+    }
+  }
+  json(res, 401, { error: "unauthorized" });
+  return null;
+}
+
+function touchHostSessionActivity(gatewayIdValue: string): void {
+  const session = hostSessions.get(gatewayIdValue);
+  if (session) {
+    session.lastSeenAt = nowIso();
+  }
+}
+
+function touchMobileSessionActivity(userId: string, deviceId: string): void {
+  const session = mobileSessions.get(`${userId}:${deviceId}`);
+  if (session) {
+    session.lastSeenAt = nowIso();
+  }
 }
 
 function ensureRateLimit(scope: string, key: string): boolean {
@@ -420,6 +438,27 @@ function broadcastToGatewayMembers(gatewayIdValue: string, envelope: RelayEnvelo
       if (session.userId === membership.userId && session.socket !== excludedSocket) {
         sendSocket(session.socket, envelope);
       }
+    }
+  }
+}
+
+function broadcastFileTransfer(gatewayIdValue: string, record: FileTransferRecord): void {
+  const payload = fileStore.toChatEventPayload(record);
+  const memberships = store.snapshot().gatewayMemberships.filter((membership) => membership.gatewayId === gatewayIdValue);
+  for (const membership of memberships) {
+    if (!canAccessFileTransfer(record, membership.userId)) {
+      continue;
+    }
+    for (const session of mobileSessions.values()) {
+      if (session.userId !== membership.userId) {
+        continue;
+      }
+      sendSocket(session.socket, {
+        type: "event",
+        gatewayId: gatewayIdValue,
+        event: "file",
+        payload,
+      });
     }
   }
 }
@@ -1447,7 +1486,7 @@ async function handleAuthRegister(req: IncomingMessage, res: ServerResponse): Pr
     createdAt: nowIso(),
     lastSeenAt: nowIso(),
   });
-  await persist();
+  schedulePersist();
 
   json(res, 200, {
     accessToken: makeAccessToken(user, deviceId, platform, appVersion),
@@ -1478,7 +1517,7 @@ async function handleAuthLogin(req: IncomingMessage, res: ServerResponse): Promi
     createdAt: nowIso(),
     lastSeenAt: nowIso(),
   });
-  await persist();
+  schedulePersist();
 
   json(res, 200, {
     accessToken: makeAccessToken(user, deviceId, platform, appVersion),
@@ -1578,7 +1617,7 @@ async function handleMobilePair(req: IncomingMessage, res: ServerResponse): Prom
 
   const accessToken = makeAccessToken(user, deviceId, platform, appVersion);
 
-  await persist();
+  schedulePersist();
   json(res, 200, {
     accessToken,
     userId,
@@ -2309,7 +2348,7 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
     });
     schedulePersist();
     const result = (payload ?? {}) as { messages?: unknown[] };
-    const items = Array.isArray(result.messages)
+    const chatItems = Array.isArray(result.messages)
       ? result.messages.flatMap((entry, index) => {
           if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
           const record = entry as Record<string, unknown>;
@@ -2334,7 +2373,16 @@ async function handleGatewayChatHistory(req: IncomingMessage, res: ServerRespons
           }];
         })
       : [];
-    json(res, 200, { items });
+    const fileItems = await fileStore.listFiles(gatewayIdValue, sessionKey, userId);
+    const mergedItems = [
+      ...chatItems,
+      ...fileItems.map((record) => fileStore.toChatHistoryItem(record))
+    ].sort((left, right) => {
+      const leftTimestamp = normalizeSessionTimestamp(left.createdAt) ? Date.parse(normalizeSessionTimestamp(left.createdAt)!) : 0;
+      const rightTimestamp = normalizeSessionTimestamp(right.createdAt) ? Date.parse(normalizeSessionTimestamp(right.createdAt)!) : 0;
+      return leftTimestamp - rightTimestamp;
+    });
+    json(res, 200, { items: mergedItems });
   } catch (error) {
     json(res, 502, { error: String(error) });
   }
@@ -2372,6 +2420,201 @@ async function handleGatewayChatReady(req: IncomingMessage, res: ServerResponse,
   }
 }
 
+async function handleMobileFileUploadInit(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const claims = requireAuthenticatedClaims(req, res);
+  if (!claims) return;
+  touchMobileSessionActivity(claims.userId, claims.deviceId);
+  touchHostSessionActivity(gatewayIdValue);
+  const userId = claims.userId;
+  const membership = getMembership(gatewayIdValue, userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  await handleFileUploadInit(req, res, gatewayIdValue, "mobile", body, userId, userId, claims.deviceId);
+}
+
+async function handleHostFileUploadInit(req: IncomingMessage, res: ServerResponse, gatewayIdValue: string): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const gateway = store.snapshot().gateways[gatewayIdValue];
+  const secret = typeof body.secret === "string" ? body.secret : "";
+  if (!gateway || sha256(secret) !== gateway.relaySecretHash) {
+    json(res, 401, { error: "unauthorized" });
+    return;
+  }
+  touchHostSessionActivity(gatewayIdValue);
+  await handleFileUploadInit(req, res, gatewayIdValue, "host", body, gateway.displayName, gateway.ownerUserId ?? undefined);
+}
+
+async function handleFileUploadInit(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  gatewayIdValue: string,
+  origin: "host" | "mobile",
+  body: Record<string, unknown>,
+  senderIdentity: string,
+  uploaderUserId?: string,
+  uploaderDeviceId?: string,
+): Promise<void> {
+  const sessionKeyRaw = typeof body.sessionKey === "string" ? body.sessionKey : "main";
+  const fileName = typeof body.fileName === "string" ? body.fileName.trim() : "";
+  const mimeType = typeof body.mimeType === "string" ? body.mimeType.trim() : "application/octet-stream";
+  const sizeBytes = typeof body.sizeBytes === "number" && Number.isFinite(body.sizeBytes) ? Math.max(0, Math.floor(body.sizeBytes)) : 0;
+  const sha = typeof body.sha256 === "string" ? body.sha256.trim() : "";
+  const senderDisplayName = typeof body.senderDisplayName === "string" ? body.senderDisplayName.trim() : undefined;
+
+  if (!fileName || !sha) {
+    json(res, 400, { error: "file_name_and_sha256_required" });
+    return;
+  }
+
+  try {
+    const response = await fileStore.initUpload({
+      gatewayId: gatewayIdValue,
+      sessionKey: sessionKeyRaw,
+      fileName,
+      mimeType,
+      sizeBytes,
+      sha256: sha,
+      origin,
+      uploaderUserId,
+      uploaderDeviceId,
+      senderDisplayName: senderDisplayName || (origin === "host" ? "ClawLink Host" : senderIdentity),
+    });
+    json(res, 200, response);
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
+async function handleMobileFileUploadChunk(req: IncomingMessage, res: ServerResponse, uploadId: string, chunkIndexRaw: string): Promise<void> {
+  const claims = requireAuthenticatedClaims(req, res);
+  if (!claims) return;
+  const chunkIndex = Number.parseInt(chunkIndexRaw, 10);
+  if (!Number.isFinite(chunkIndex) || chunkIndex < 0) {
+    json(res, 400, { error: "invalid_chunk_index" });
+    return;
+  }
+  const uploadSession = await fileStore.peekUpload(uploadId);
+  if (uploadSession) {
+    touchHostSessionActivity(uploadSession.gatewayId);
+  }
+  touchMobileSessionActivity(claims.userId, claims.deviceId);
+  await handleFileUploadChunk(req, res, uploadId, chunkIndex);
+}
+
+async function handleHostFileUploadChunk(req: IncomingMessage, res: ServerResponse, uploadId: string, chunkIndexRaw: string): Promise<void> {
+  const chunkIndex = Number.parseInt(chunkIndexRaw, 10);
+  if (!Number.isFinite(chunkIndex) || chunkIndex < 0) {
+    json(res, 400, { error: "invalid_chunk_index" });
+    return;
+  }
+  const uploadSession = await fileStore.peekUpload(uploadId);
+  if (uploadSession) {
+    touchHostSessionActivity(uploadSession.gatewayId);
+  }
+  await handleFileUploadChunk(req, res, uploadId, chunkIndex);
+}
+
+async function handleFileUploadChunk(req: IncomingMessage, res: ServerResponse, uploadId: string, chunkIndex: number): Promise<void> {
+  try {
+    const uploadSession = await fileStore.peekUpload(uploadId);
+    if (uploadSession) {
+      touchHostSessionActivity(uploadSession.gatewayId);
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    await fileStore.writeChunk(uploadId, chunkIndex, Buffer.concat(chunks));
+    json(res, 200, { ok: true });
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
+async function handleMobileFileUploadComplete(req: IncomingMessage, res: ServerResponse, uploadId: string): Promise<void> {
+  const claims = requireAuthenticatedClaims(req, res);
+  if (!claims) return;
+  const uploadSession = await fileStore.peekUpload(uploadId);
+  if (uploadSession) {
+    touchHostSessionActivity(uploadSession.gatewayId);
+  }
+  touchMobileSessionActivity(claims.userId, claims.deviceId);
+  await handleFileUploadComplete(req, res, uploadId);
+}
+
+async function handleHostFileUploadComplete(req: IncomingMessage, res: ServerResponse, uploadId: string): Promise<void> {
+  const uploadSession = await fileStore.peekUpload(uploadId);
+  if (uploadSession) {
+    touchHostSessionActivity(uploadSession.gatewayId);
+  }
+  await handleFileUploadComplete(req, res, uploadId);
+}
+
+async function handleFileUploadComplete(req: IncomingMessage, res: ServerResponse, uploadId: string): Promise<void> {
+  const body = (await readJson<Record<string, unknown>>(req)) ?? {};
+  const totalChunks = typeof body.totalChunks === "number" && Number.isFinite(body.totalChunks) ? Math.floor(body.totalChunks) : 0;
+  try {
+    const uploadSession = await fileStore.peekUpload(uploadId);
+    if (uploadSession) {
+      touchHostSessionActivity(uploadSession.gatewayId);
+    }
+    const record = await fileStore.completeUpload(uploadId, totalChunks);
+    broadcastFileTransfer(record.gatewayId, record);
+    json(res, 200, {
+      ok: true,
+      payload: {
+        ...record,
+        downloadUrl: record.downloadPath,
+      },
+    });
+  } catch (error) {
+    json(res, 502, { error: String(error) });
+  }
+}
+
+async function handleMobileFileDownload(req: IncomingMessage, res: ServerResponse, fileId: string): Promise<void> {
+  const claims = requireAuthenticatedClaims(req, res);
+  if (!claims) return;
+
+  const record = await fileStore.downloadFile(fileId);
+  if (!record) {
+    json(res, 404, { error: "file_not_found" });
+    return;
+  }
+
+  touchHostSessionActivity(record.gatewayId);
+  touchMobileSessionActivity(claims.userId, claims.deviceId);
+  const membership = getMembership(record.gatewayId, claims.userId);
+  if (!membership) {
+    json(res, 404, { error: "gateway_not_found" });
+    return;
+  }
+  if (!canAccessFileTransfer(record, claims.userId)) {
+    json(res, 403, { error: "file_not_owned" });
+    return;
+  }
+
+  try {
+    const source = await fileStore.openDownload(record);
+    res.writeHead(200, {
+      "Content-Type": record.mimeType || "application/octet-stream",
+      "Content-Length": String(source.contentLength),
+      "Content-Disposition": `attachment; filename="${record.fileName.replace(/"/g, '\\"')}"`,
+      "Cache-Control": "private, max-age=0, no-cache",
+    });
+    await pipeline(source.stream, res);
+  } catch (error) {
+    if (!res.headersSent) {
+      json(res, 502, { error: String(error) });
+      return;
+    }
+    res.destroy(error instanceof Error ? error : undefined);
+  }
+}
+
 function normalizeSessionTimestamp(value: unknown): string | undefined {
   if (value instanceof Date && Number.isFinite(value.getTime())) {
     return value.toISOString();
@@ -2383,7 +2626,7 @@ function normalizeSessionTimestamp(value: unknown): string | undefined {
     if (!Number.isNaN(parsed)) {
       return new Date(parsed).toISOString();
     }
-    return trimmedValue;
+    return undefined;
   }
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
     const millis = value > 10_000_000_000 ? value : value * 1000;
@@ -2934,6 +3177,45 @@ const server = createServer((req, res) => {
         return;
       }
 
+      const mobileFileInitMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/files\/init$/);
+      if (mobileFileInitMatch && req.method === "POST") {
+        await handleMobileFileUploadInit(req, res, mobileFileInitMatch[1]);
+        return;
+      }
+      const hostFileInitMatch = requestUrl.pathname.match(/^\/api\/host\/gateways\/([^/]+)\/files\/init$/);
+      if (hostFileInitMatch && req.method === "POST") {
+        await handleHostFileUploadInit(req, res, hostFileInitMatch[1]);
+        return;
+      }
+
+      const mobileFileChunkMatch = requestUrl.pathname.match(/^\/api\/mobile\/files\/([^/]+)\/chunks\/(\d+)$/);
+      if (mobileFileChunkMatch && req.method === "PUT") {
+        await handleMobileFileUploadChunk(req, res, mobileFileChunkMatch[1], mobileFileChunkMatch[2]);
+        return;
+      }
+      const hostFileChunkMatch = requestUrl.pathname.match(/^\/api\/host\/files\/([^/]+)\/chunks\/(\d+)$/);
+      if (hostFileChunkMatch && req.method === "PUT") {
+        await handleHostFileUploadChunk(req, res, hostFileChunkMatch[1], hostFileChunkMatch[2]);
+        return;
+      }
+
+      const mobileFileCompleteMatch = requestUrl.pathname.match(/^\/api\/mobile\/files\/([^/]+)\/complete$/);
+      if (mobileFileCompleteMatch && req.method === "POST") {
+        await handleMobileFileUploadComplete(req, res, mobileFileCompleteMatch[1]);
+        return;
+      }
+      const hostFileCompleteMatch = requestUrl.pathname.match(/^\/api\/host\/files\/([^/]+)\/complete$/);
+      if (hostFileCompleteMatch && req.method === "POST") {
+        await handleHostFileUploadComplete(req, res, hostFileCompleteMatch[1]);
+        return;
+      }
+
+      const mobileFileDownloadMatch = requestUrl.pathname.match(/^\/api\/mobile\/files\/([^/]+)$/);
+      if (mobileFileDownloadMatch && req.method === "GET") {
+        await handleMobileFileDownload(req, res, mobileFileDownloadMatch[1]);
+        return;
+      }
+
       const modelSelectMatch = requestUrl.pathname.match(/^\/api\/mobile\/gateways\/([^/]+)\/models\/select$/);
       if (modelSelectMatch && req.method === "POST") {
         await handleGatewayModelSelect(req, res, modelSelectMatch[1]);
@@ -3425,27 +3707,40 @@ mobileWsServer.on("connection", async (socket, req) => {
   });
 });
 
-setInterval(async () => {
-  const now = Date.now();
-  for (const [gatewayIdValue, session] of hostSessions.entries()) {
-    if (now - new Date(session.lastSeenAt).getTime() > config.wsIdleTimeoutMs) {
-      session.socket.terminate();
-      hostSessions.delete(gatewayIdValue);
-    } else {
-      sendSocket(session.socket, { type: "heartbeat", gatewayId: gatewayIdValue, payload: { now: nowIso() } });
-    }
+setInterval(() => {
+  if (fileCleanupInFlight) {
+    return;
   }
-  for (const [sessionKey, session] of mobileSessions.entries()) {
-    if (now - new Date(session.lastSeenAt).getTime() > config.wsIdleTimeoutMs) {
-      session.socket.terminate();
-      mobileSessions.delete(sessionKey);
-    } else {
-      sendSocket(session.socket, { type: "heartbeat", payload: { now: nowIso() } });
+  fileCleanupInFlight = true;
+  void (async () => {
+    try {
+      const now = Date.now();
+      await fileStore.cleanupExpired(new Date(now));
+      for (const [gatewayIdValue, session] of hostSessions.entries()) {
+        if (now - new Date(session.lastSeenAt).getTime() > config.wsIdleTimeoutMs) {
+          session.socket.terminate();
+          hostSessions.delete(gatewayIdValue);
+        } else {
+          sendSocket(session.socket, { type: "heartbeat", gatewayId: gatewayIdValue, payload: { now: nowIso() } });
+        }
+      }
+      for (const [sessionKey, session] of mobileSessions.entries()) {
+        if (now - new Date(session.lastSeenAt).getTime() > config.wsIdleTimeoutMs) {
+          session.socket.terminate();
+          mobileSessions.delete(sessionKey);
+        } else {
+          sendSocket(session.socket, { type: "heartbeat", payload: { now: nowIso() } });
+        }
+      }
+      metrics.hostConnections = hostSessions.size;
+      metrics.mobileConnections = mobileSessions.size;
+      schedulePersist(config.heartbeatIntervalMs);
+    } catch (error) {
+      console.error("[relay] maintenance tick failed", error);
+    } finally {
+      fileCleanupInFlight = false;
     }
-  }
-  metrics.hostConnections = hostSessions.size;
-  metrics.mobileConnections = mobileSessions.size;
-  schedulePersist(config.heartbeatIntervalMs);
+  })();
 }, config.heartbeatIntervalMs).unref();
 
 server.listen(config.port, config.host, () => {

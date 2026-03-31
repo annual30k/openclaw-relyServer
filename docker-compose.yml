@@ -1,13 +1,12 @@
 services:
   mysql:
-    image: mysql:5.7
+    image: mysql:8.4.8
     platform: linux/amd64
     container_name: pocketclaw-relay-mysql
     restart: unless-stopped
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
-      - --default-authentication-plugin=mysql_native_password
     ports:
       - "3306:3306"
     environment:
@@ -24,12 +23,28 @@ services:
       timeout: 5s
       retries: 10
 
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    container_name: pocketclaw-relay-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: pocketclaw
+      MINIO_ROOT_PASSWORD: pocketclawminio123
+    volumes:
+      - minio-data:/data
+
   relay-api:
     build:
       context: .
     depends_on:
       mysql:
         condition: service_healthy
+      minio:
+        condition: service_started
     ports:
       - "8080:8080"
     environment:
@@ -38,6 +53,17 @@ services:
       JWT_SECRET: change-me
       DATA_DIR: /app/.data
       DATABASE_URL: mysql://pocketclaw:pocketclaw123@mysql:3306/pocketclaw_relay
+      FILE_STORAGE_DRIVER: minio
+      FILE_CHUNK_SIZE_BYTES: 5242880
+      FILE_UPLOAD_TTL_SECONDS: 1800
+      FILE_TTL_SECONDS: 604800
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_USE_SSL: "false"
+      MINIO_ACCESS_KEY: pocketclaw
+      MINIO_SECRET_KEY: pocketclawminio123
+      MINIO_BUCKET: pocketclaw-files
+      MINIO_REGION: us-east-1
       ACCESS_CODE_TTL_SECONDS: 300
       HEARTBEAT_INTERVAL_MS: 30000
       WS_IDLE_TIMEOUT_MS: 70000
@@ -49,4 +75,5 @@ services:
 
 volumes:
   mysql-data:
+  minio-data:
   relay-data:

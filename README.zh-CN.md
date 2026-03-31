@@ -12,7 +12,9 @@
 - 技能状态查询与写回主机端
 - 高危命令审批
 - 审计日志
-- MySQL 5.7 持久化
+- MySQL 8.4 LTS 持久化
+- 文件互传元数据持久化
+- 本地磁盘或 MinIO 对象存储文件本体
 - Docker / Docker Compose 部署
 
 ## 目录说明
@@ -53,10 +55,13 @@ npm run build
 docker compose up -d --build
 ```
 
-启动后会包含两个服务：
+启动后会包含三个服务：
 
 - `relay-api`
-- `mysql:5.7`
+- `mysql:8.4.8`
+- `minio`
+
+如果测试环境是从 MySQL 5.7 切到 8.4，请直接重建 MySQL 容器和数据库 volume，不要复用旧的 5.7 数据目录。
 
 健康检查：
 
@@ -88,6 +93,18 @@ curl http://127.0.0.1:8080/healthz
 - `APPROVAL_TTL_SECONDS`
 - `RATE_LIMIT_WINDOW_MS`
 - `RATE_LIMIT_MAX`
+- `AUTH_TOKEN_TTL_SECONDS`
+- `FILE_STORAGE_DRIVER`
+- `FILE_CHUNK_SIZE_BYTES`
+- `FILE_UPLOAD_TTL_SECONDS`
+- `FILE_TTL_SECONDS`
+- `MINIO_ENDPOINT`
+- `MINIO_PORT`
+- `MINIO_USE_SSL`
+- `MINIO_ACCESS_KEY`
+- `MINIO_SECRET_KEY`
+- `MINIO_BUCKET`
+- `MINIO_REGION`
 
 ## 自动创建的表
 
@@ -103,6 +120,9 @@ curl http://127.0.0.1:8080/healthz
 - `command_audit_logs`
 - `api_tokens`
 - `approvals`
+- `file_transfers`
+
+`DATA_DIR` 仍然用于上传分块的临时目录。完成上传后的文件本体可落本地磁盘，也可落到 MinIO；文件元数据统一存 MySQL。
 
 ## HTTP 接口
 
@@ -116,6 +136,13 @@ curl http://127.0.0.1:8080/healthz
 - `GET /api/mobile/gateways/:gatewayId/skills`
 - `PATCH /api/mobile/gateways/:gatewayId/skills/:skillKey`
 - `POST /api/mobile/gateways/:gatewayId/approve-sensitive-action`
+- `POST /api/host/gateways/:gatewayId/files/init`
+- `PUT /api/host/files/:uploadId/chunks/:index`
+- `POST /api/host/files/:uploadId/complete`
+- `POST /api/mobile/gateways/:gatewayId/files/init`
+- `PUT /api/mobile/files/:uploadId/chunks/:index`
+- `POST /api/mobile/files/:uploadId/complete`
+- `GET /api/mobile/files/:fileId`
 - `GET /healthz`
 - `GET /metrics`
 
@@ -132,7 +159,7 @@ Mobile：
 
 ## 当前实现说明
 
-当前版本已经正式使用 MySQL 5.7 做持久化，不再依赖本地 JSON 文件作为主存储。
+当前版本已经正式使用 MySQL 8.4 LTS 做持久化，不再依赖本地 JSON 文件作为主存储。文件互传的完成态元数据也落 MySQL，文件本体可走本地磁盘或 MinIO。
 
 已经验证通过的流程：
 

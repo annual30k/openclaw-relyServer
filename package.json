@@ -6,9 +6,11 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "node --test --import tsx src/files/*.test.ts"
   },
   "dependencies": {
+    "minio": "^8.0.6",
     "mysql2": "^3.14.5",
     "ws": "^8.18.0"
   },
