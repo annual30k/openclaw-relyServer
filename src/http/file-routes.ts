@@ -31,6 +31,13 @@ interface FileRouteOptions {
   broadcastFileTransfer: (gatewayIdValue: string, record: FileTransferRecord) => void;
 }
 
+export function buildAttachmentContentDisposition(fileName: string): string {
+  const trimmed = fileName.trim();
+  const fallbackName = sanitizeAsciiFilename(trimmed || "download");
+  const encodedName = encodeRFC5987ValueChars(trimmed || "download");
+  return `attachment; filename="${fallbackName}"; filename*=UTF-8''${encodedName}`;
+}
+
 export function createFileRouteHandlers(options: FileRouteOptions): FileRouteHandlers {
   const handleFileUploadInit = async (
     res: ServerResponse,
@@ -265,7 +272,7 @@ export function createFileRouteHandlers(options: FileRouteOptions): FileRouteHan
       res.writeHead(200, {
         "Content-Type": record.mimeType || "application/octet-stream",
         "Content-Length": String(source.contentLength),
-        "Content-Disposition": `attachment; filename="${record.fileName.replace(/"/g, '\\"')}"`,
+        "Content-Disposition": buildAttachmentContentDisposition(record.fileName),
         "Cache-Control": "private, max-age=0, no-cache",
       });
       await pipeline(source.stream, res);
@@ -287,4 +294,20 @@ export function createFileRouteHandlers(options: FileRouteOptions): FileRouteHan
     handleHostFileUploadComplete,
     handleMobileFileDownload,
   };
+}
+
+function sanitizeAsciiFilename(fileName: string): string {
+  const asciiOnly = fileName
+    .replace(/[\r\n]/g, "")
+    .replace(/[\\/]/g, "_")
+    .replace(/[^\x20-\x7E]/g, "_")
+    .replace(/["\\]/g, "\\$&")
+    .trim();
+  return asciiOnly || "download";
+}
+
+function encodeRFC5987ValueChars(value: string): string {
+  return encodeURIComponent(value)
+    .replace(/['()]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
+    .replace(/\*/g, "%2A");
 }
