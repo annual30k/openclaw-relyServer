@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "crypto";
 import { access, mkdir, open, readFile, rm } from "fs/promises";
 import { join } from "path";
 import { buildStoredObjectKey, normalizeSessionKey, safeStoredFileName } from "./helpers.js";
+import { buildFileContentBlock } from "./file-formatters.js";
 import { MySqlFileTransferMetadataStore } from "./metadata-store.js";
 import { createFileObjectStorage, type FileObjectStorage } from "./object-storage.js";
 import type {
@@ -221,27 +222,33 @@ export class FileTransferStore {
     createdAt: string;
   } {
     const block = buildFileContentBlock(record);
+    const chatTimestamp = Number.isFinite(record.sortTimestampMs) && record.sortTimestampMs > 0
+      ? new Date(record.sortTimestampMs).toISOString()
+      : (record.createdAt || record.updatedAt);
     return {
       id: `file-${record.fileId}`,
       role: record.origin === "mobile" ? "user" : "assistant",
       content: record.fileName,
       contentBlocks: [block],
-      createdAt: record.createdAt,
+      createdAt: chatTimestamp,
     };
   }
 
   toChatEventPayload(record: FileTransferRecord): Record<string, unknown> {
     const historyItem = this.toChatHistoryItem(record);
+    const sortTimestamp = Number.isFinite(record.sortTimestampMs) && record.sortTimestampMs > 0
+      ? record.sortTimestampMs
+      : Date.parse(historyItem.createdAt);
     return {
       state: "final",
       role: historyItem.role,
       sessionKey: record.sessionKey,
       runId: historyItem.id,
-      ts: Date.parse(historyItem.createdAt),
+      ts: sortTimestamp,
       text: historyItem.content,
       message: {
         role: historyItem.role,
-        timestamp: Date.parse(historyItem.createdAt),
+        timestamp: sortTimestamp,
         content: historyItem.contentBlocks,
       },
     };
@@ -271,31 +278,4 @@ export class FileTransferStore {
     const { extension } = safeStoredFileName(fileName);
     return join(this.uploadDir(uploadId), `${fileId}.assembled${extension}`);
   }
-}
-
-export function buildFileContentBlock(record: FileTransferRecord): Record<string, unknown> {
-  return {
-    type: "file",
-    text: record.fileName,
-    name: record.fileName,
-    gatewayId: record.gatewayId,
-    sessionKey: record.sessionKey,
-    fileId: record.fileId,
-    fileName: record.fileName,
-    mimeType: record.mimeType,
-    sizeBytes: record.sizeBytes,
-    downloadUrl: record.downloadPath,
-    expiresAt: record.expiresAt,
-    senderDisplayName: record.senderDisplayName,
-    origin: record.origin,
-    storageBackend: record.storageBackend,
-    storageKey: record.storageKey,
-  };
-}
-
-export function canAccessFileTransfer(record: FileTransferRecord, userId: string): boolean {
-  if (!record.uploaderUserId) {
-    return true;
-  }
-  return record.uploaderUserId === userId;
 }

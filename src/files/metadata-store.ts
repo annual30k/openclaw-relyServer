@@ -30,6 +30,7 @@ type FileTransferRow = RowDataPacket & {
   chunk_size: number;
   total_chunks: number;
   expires_at: string;
+  sort_timestamp_ms: number | string;
   created_at: string;
   updated_at: string;
 };
@@ -45,7 +46,8 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
   }
 
   async createUpload(input: CreateUploadRecordInput): Promise<FileTransferRecord> {
-    const createdAt = new Date().toISOString();
+    const createdAt = normalizeTimestamp(input.clientCreatedAt ?? new Date().toISOString());
+    const sortTimestampMs = Date.parse(createdAt);
     await this.pool.query(
       `
         INSERT INTO file_transfers (
@@ -53,9 +55,9 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
           uploader_user_id, uploader_device_id, sender_display_name,
           file_name, mime_type, size_bytes, sha256, status,
           storage_backend, storage_bucket, storage_key, storage_path,
-          download_path, chunk_size, total_chunks, expires_at, created_at, updated_at
+          download_path, chunk_size, total_chunks, expires_at, sort_timestamp_ms, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'initiated', ?, NULL, NULL, '', ?, ?, 0, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'initiated', ?, NULL, NULL, '', ?, ?, 0, ?, ?, ?, ?)
       `,
       [
         input.fileId,
@@ -74,6 +76,7 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
         input.downloadPath,
         Math.max(1, Math.floor(input.chunkSize)),
         toSqlDate(input.expiresAt),
+        Number.isFinite(sortTimestampMs) && sortTimestampMs > 0 ? Math.floor(sortTimestampMs) : 0,
         toSqlDate(createdAt),
         toSqlDate(createdAt),
       ],
@@ -115,7 +118,9 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
   }
 
   async completeUpload(input: CompleteUploadRecordInput): Promise<FileTransferRecord> {
-    const completedAt = new Date().toISOString();
+    const completedAt = new Date();
+    const completedAtIso = completedAt.toISOString();
+    const completedSortTimestampMs = completedAt.getTime();
     await this.pool.query(
       `
         UPDATE file_transfers
@@ -125,6 +130,7 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
             storage_path = ?,
             total_chunks = ?,
             expires_at = ?,
+            sort_timestamp_ms = ?,
             updated_at = ?
         WHERE upload_id = ? AND status IN ('initiated', 'uploading')
       `,
@@ -134,7 +140,8 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
         input.storage.storagePath,
         Math.max(1, Math.floor(input.totalChunks)),
         toSqlDate(input.expiresAt),
-        toSqlDate(completedAt),
+        completedSortTimestampMs,
+        toSqlDate(completedAtIso),
         input.uploadId,
       ],
     );
@@ -155,7 +162,7 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
       params.splice(1, 0, normalizeSessionKey(sessionKey));
     }
     const [rows] = await this.pool.query<FileTransferRow[]>(
-      `SELECT * FROM file_transfers WHERE ${clauses.join(" AND ")} ORDER BY created_at ASC`,
+      `SELECT * FROM file_transfers WHERE ${clauses.join(" AND ")} ORDER BY sort_timestamp_ms ASC, created_at ASC`,
       params,
     );
     return rows.map(mapRow);
@@ -168,7 +175,7 @@ export class MySqlFileTransferMetadataStore implements FileTransferMetadataStore
         FROM file_transfers
         WHERE gateway_id = ?
           AND status <> 'deleted'
-        ORDER BY created_at ASC
+        ORDER BY sort_timestamp_ms ASC, created_at ASC
       `,
       [gatewayId],
     );
@@ -232,6 +239,7 @@ function mapRow(row: FileTransferRow): FileTransferRecord {
     uploaderDeviceId: normalizeText(row.uploader_device_id),
     senderDisplayName: normalizeText(row.sender_display_name),
     createdAt: normalizeTimestamp(toIso(row.created_at) ?? new Date().toISOString()),
+    sortTimestampMs: Math.max(0, Math.floor(Number(row.sort_timestamp_ms) || 0)) || Date.parse(normalizeTimestamp(toIso(row.created_at) ?? new Date().toISOString())),
     updatedAt: normalizeTimestamp(toIso(row.updated_at) ?? new Date().toISOString()),
     expiresAt: normalizeTimestamp(toIso(row.expires_at) ?? new Date().toISOString()),
     status: normalizeStatus(row.status),

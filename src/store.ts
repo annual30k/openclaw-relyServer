@@ -301,10 +301,32 @@ export class RelayStore {
     if (!runtimeColumnSet.has("context_limit")) {
       await this.pool.query("ALTER TABLE gateway_runtime_state ADD COLUMN context_limit INT DEFAULT NULL AFTER context_usage");
     }
+    const [fileTransferColumns] = await this.pool.query<RowDataPacket[]>(
+      "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'file_transfers'",
+    );
+    const fileTransferColumnSet = new Set(fileTransferColumns.map((row) => String(row.COLUMN_NAME)));
+    if (!fileTransferColumnSet.has("sort_timestamp_ms")) {
+      await this.pool.query(
+        "ALTER TABLE file_transfers ADD COLUMN sort_timestamp_ms BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER expires_at",
+      );
+    }
+    await this.pool.query(
+      "UPDATE file_transfers SET sort_timestamp_ms = UNIX_TIMESTAMP(created_at) * 1000 WHERE sort_timestamp_ms = 0",
+    );
     const [fileTransferIndexes] = await this.pool.query<RowDataPacket[]>(
       "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'file_transfers'",
     );
     const fileTransferIndexSet = new Set(fileTransferIndexes.map((row) => String(row.INDEX_NAME)));
+    if (!fileTransferIndexSet.has("idx_file_transfers_gateway_status_sort_timestamp_ms")) {
+      await this.pool.query(
+        "ALTER TABLE file_transfers ADD INDEX idx_file_transfers_gateway_status_sort_timestamp_ms (gateway_id, status, sort_timestamp_ms)",
+      );
+    }
+    if (!fileTransferIndexSet.has("idx_file_transfers_gateway_session_status_sort_timestamp_ms")) {
+      await this.pool.query(
+        "ALTER TABLE file_transfers ADD INDEX idx_file_transfers_gateway_session_status_sort_timestamp_ms (gateway_id, session_key, status, sort_timestamp_ms)",
+      );
+    }
     if (!fileTransferIndexSet.has("idx_file_transfers_gateway_status_created_at")) {
       await this.pool.query(
         "ALTER TABLE file_transfers ADD INDEX idx_file_transfers_gateway_status_created_at (gateway_id, status, created_at)",

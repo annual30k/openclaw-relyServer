@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
-import { FileTransferStore, buildFileContentBlock } from "./file-transfer-store.js";
+import { FileTransferStore } from "./file-transfer-store.js";
+import { buildFileContentBlock } from "./file-formatters.js";
 import type {
   CompleteUploadRecordInput,
   CreateUploadRecordInput,
@@ -18,6 +19,8 @@ class InMemoryMetadataStore implements FileTransferMetadataStore {
   private readonly uploadIds = new Map<string, string>();
 
   async createUpload(input: CreateUploadRecordInput): Promise<FileTransferRecord> {
+    const createdAt = input.clientCreatedAt ?? new Date().toISOString();
+    const sortTimestampMs = Date.parse(createdAt);
     const record: FileTransferRecord = {
       fileId: input.fileId,
       uploadId: input.uploadId,
@@ -31,8 +34,9 @@ class InMemoryMetadataStore implements FileTransferMetadataStore {
       uploaderUserId: input.uploaderUserId,
       uploaderDeviceId: input.uploaderDeviceId,
       senderDisplayName: input.senderDisplayName,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt,
+      sortTimestampMs: Number.isFinite(sortTimestampMs) && sortTimestampMs > 0 ? sortTimestampMs : Date.now(),
+      updatedAt: createdAt,
       expiresAt: input.expiresAt,
       status: "initiated",
       storageBackend: input.storageBackend,
@@ -65,6 +69,7 @@ class InMemoryMetadataStore implements FileTransferMetadataStore {
   async completeUpload(input: CompleteUploadRecordInput): Promise<FileTransferRecord> {
     const record = await this.getUpload(input.uploadId);
     assert.ok(record);
+    const completedAt = new Date();
     record.status = "completed";
     record.storageBackend = input.storage.storageBackend;
     record.storageBucket = input.storage.storageBucket;
@@ -72,7 +77,8 @@ class InMemoryMetadataStore implements FileTransferMetadataStore {
     record.storagePath = input.storage.storagePath;
     record.totalChunks = input.totalChunks;
     record.expiresAt = input.expiresAt;
-    record.updatedAt = new Date().toISOString();
+    record.updatedAt = completedAt.toISOString();
+    record.sortTimestampMs = completedAt.getTime();
     return record;
   }
 
@@ -165,6 +171,7 @@ test("file transfer store completes upload and builds file block", async () => {
   try {
     const buffer = Buffer.from("hello relay");
     const sha256 = "d6d73b3e899f235e4c4540a978ac34c5bcd2dea1437991da046282f41844692b";
+    const clientCreatedAt = "2026-04-01T08:00:00.000Z";
     const init = await store.initUpload({
       gatewayId: "gw_1",
       sessionKey: "main",
@@ -175,6 +182,7 @@ test("file transfer store completes upload and builds file block", async () => {
       origin: "host",
       uploaderUserId: "user_1",
       senderDisplayName: "ClawLink Host",
+      clientCreatedAt,
     });
 
     await store.writeChunk(init.uploadId, 0, buffer.subarray(0, 4));
@@ -184,6 +192,18 @@ test("file transfer store completes upload and builds file block", async () => {
     const record = await store.completeUpload(init.uploadId, 3);
     assert.equal(record.status, "completed");
     assert.equal(record.storageKey?.includes(record.fileId), true);
+    assert.equal(record.createdAt, clientCreatedAt);
+    assert.equal(record.sortTimestampMs, Date.parse(record.updatedAt));
+
+    const chatItem = store.toChatHistoryItem(record);
+    assert.equal(chatItem.createdAt, new Date(record.sortTimestampMs).toISOString());
+
+    const eventPayload = store.toChatEventPayload(record) as {
+      ts?: number;
+      message?: { timestamp?: number };
+    };
+    assert.equal(eventPayload.ts, record.sortTimestampMs);
+    assert.equal(eventPayload.message?.timestamp, record.sortTimestampMs);
 
     const items = await store.listFiles("gw_1", "main", "user_1");
     assert.equal(items.length, 1);

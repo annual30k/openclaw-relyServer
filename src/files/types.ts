@@ -21,6 +21,7 @@ export interface FileTransferInitInput {
   uploaderUserId?: string;
   uploaderDeviceId?: string;
   senderDisplayName?: string;
+  clientCreatedAt?: string;
 }
 
 export interface FileTransferInitResult {
@@ -45,6 +46,7 @@ export interface FileTransferRecord {
   uploaderDeviceId?: string;
   senderDisplayName?: string;
   createdAt: string;
+  sortTimestampMs: number;
   updatedAt: string;
   expiresAt: string;
   status: FileTransferStatus;
