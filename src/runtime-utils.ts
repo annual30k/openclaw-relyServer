@@ -49,10 +49,20 @@ export function normalizeRealtimeChatPayload(rawPayload: unknown, fallbackTimest
   }
 
   const payload = { ...(rawPayload as Record<string, unknown>) };
-  const messageRecord =
+  const existingMessageRecord =
     payload.message && typeof payload.message === "object" && !Array.isArray(payload.message)
       ? { ...(payload.message as Record<string, unknown>) }
       : undefined;
+  const hasTopLevelMessageFields =
+    typeof payload.role === "string"
+    || typeof payload.text === "string"
+    || typeof payload.content === "string"
+    || Array.isArray(payload.content)
+    || typeof payload.result === "string"
+    || typeof payload.output === "string"
+    || typeof payload.stopReason === "string"
+    || typeof payload.errorMessage === "string";
+  const messageRecord = existingMessageRecord ?? (hasTopLevelMessageFields ? {} : undefined);
   const resolvedTimestamp =
     normalizeEventTimestamp(payload.ts)
     ?? normalizeEventTimestamp(payload.timestamp)
@@ -72,6 +82,15 @@ export function normalizeRealtimeChatPayload(rawPayload: unknown, fallbackTimest
       && payload.role.trim()
     ) {
       messageRecord.role = payload.role.trim();
+    }
+    if (typeof payload.text === "string" && payload.text.trim()) {
+      messageRecord.text = payload.text;
+      if (!Array.isArray(messageRecord.content) && !messageRecord.content) {
+        messageRecord.content = [{ type: "text", text: payload.text }];
+      }
+    }
+    if (Array.isArray(payload.content) && !messageRecord.content) {
+      messageRecord.content = payload.content;
     }
     payload.message = messageRecord;
   }

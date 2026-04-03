@@ -3,9 +3,13 @@ import type { RiskLevel } from "./types.js";
 const HIGH_RISK_METHODS = new Set([
   "host.restore.config",
   "host.gateway.restart",
+  "host.gateway.remoteRestart",
   "clawpilot.gateway.restart",
+  "clawpilot.gateway.remoteRestart",
   "clawconnect.gateway.restart",
+  "clawconnect.gateway.remoteRestart",
   "pocketclaw.gateway.restart",
+  "pocketclaw.gateway.remoteRestart",
   "host.update.openclaw",
   "provider.add",
   "provider.delete",
