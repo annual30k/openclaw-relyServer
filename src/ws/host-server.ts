@@ -146,17 +146,28 @@ export function registerHostWsServer(
           normalizedPayload && typeof normalizedPayload === "object" && !Array.isArray(normalizedPayload)
             ? (normalizedPayload as Record<string, unknown>)
             : undefined;
-        const currentModel =
+        const currentModelRaw =
           typeof payloadRecord?.currentModel === "string"
             ? payloadRecord.currentModel
             : typeof payloadRecord?.model === "string"
               ? payloadRecord.model
               : undefined;
+        const currentModel =
+          typeof currentModelRaw === "string" && currentModelRaw.trim().length > 0
+            ? currentModelRaw.trim()
+            : undefined;
         const { contextUsage, contextLimit } = options.extractContextMetrics(payloadRecord);
+        const runtime = options.store.snapshot().gatewayRuntimeState[gatewayIdValue];
         const runtimePatch: Partial<GatewayRuntimeStateRecord> = {
           lastSeenAt: options.nowIso(),
         };
-        if (currentModel) {
+        const existingCurrentModel = typeof runtime?.currentModel === "string" ? runtime.currentModel.trim() : "";
+        const shouldUpdateCurrentModel =
+          currentModel !== undefined
+          && (message.event !== "context_usage"
+            || existingCurrentModel.length === 0
+            || existingCurrentModel === currentModel);
+        if (shouldUpdateCurrentModel) {
           runtimePatch.currentModel = currentModel;
         }
         if (contextUsage !== undefined) {

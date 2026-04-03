@@ -97,6 +97,14 @@ export interface GatewayRouteOptions {
   broadcastToGatewayMembers: (gatewayIdValue: string, envelope: RelayEnvelope) => void;
 }
 
+export function resolveModelSelectionSessionKey(rawSessionKey: unknown): string {
+  if (typeof rawSessionKey !== "string") {
+    return "main";
+  }
+  const trimmed = rawSessionKey.trim();
+  return trimmed.length > 0 ? trimmed : "main";
+}
+
 export function createGatewayRouteHandlers(options: GatewayRouteOptions): GatewayRouteHandlers {
   const markGatewayHealthy = (gatewayIdValue: string): void => {
     options.touchGateway(gatewayIdValue, {
@@ -603,6 +611,7 @@ export function createGatewayRouteHandlers(options: GatewayRouteOptions): Gatewa
     const modelAliasRaw = typeof body.modelAlias === "string" ? body.modelAlias.trim() : "";
     const modelName = typeof body.modelName === "string" ? body.modelName.trim() : "";
     const modelAlias = modelAliasRaw || modelName || modelId;
+    const sessionKey = resolveModelSelectionSessionKey(body.sessionKey);
     if (!providerId || !modelId || !modelAlias) {
       json(res, 400, { error: "providerId_modelId_and_modelName_required" });
       return;
@@ -610,7 +619,7 @@ export function createGatewayRouteHandlers(options: GatewayRouteOptions): Gatewa
 
     try {
       const payload = await options.dispatchHostCommand(gatewayIdValue, userId, "chat.send", {
-        sessionKey: "main",
+        sessionKey,
         message: `/model ${modelAlias}`,
         idempotencyKey: randomUUID(),
       });
@@ -637,6 +646,7 @@ export function createGatewayRouteHandlers(options: GatewayRouteOptions): Gatewa
           modelId,
           modelAlias,
           modelName,
+          sessionKey,
           currentModel: modelAlias,
         },
       });
